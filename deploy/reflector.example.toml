@@ -1,0 +1,21 @@
+# buffmon-reflector example. Install as /etc/buffmon/reflector.toml.
+
+listen = "0.0.0.0:862"
+
+# Required. Only these source prefixes get replies. Keep it to your site
+# subnets (and the SD-WAN/SSE NAT ranges the probes may appear from).
+allow = ["10.0.0.0/8", "172.16.0.0/12"]
+
+# Per source IP, packets per second (1 s burst). 2000 covers 100+ probe
+# sessions behind one NAT address.
+rate_limit_pps = 2000
+
+# Sessions are keyed by source ip:port and forgotten after this much idle time.
+max_sessions = 10000
+session_idle_s = 300
+
+# Reply with the DSCP the probe used, so the return path is classified like
+# the forward path. ECN bits are never echoed.
+reflect_dscp = true
+
+stats_interval_s = 60

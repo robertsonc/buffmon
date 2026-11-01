@@ -1,0 +1,78 @@
+# buffmon-probe example: one branch site probe with nested targets, so the first
+# target that degrades points at the segment (docs/DESIGN.md §3).
+#
+# Install as /etc/buffmon/probe.toml (0644 — it holds no secrets).
+
+probe_id = "sjc-br01-p1"     # [A-Za-z0-9._-], unique per probe
+site = "SJC-BR01"            # same site name as Orchestrator / Central
+
+[output]
+url = "https://buffmon.lab.example:8443/v1/probe/results"
+# The token comes from systemd LoadCredential= (see buffmon-probe.service).
+token_file = "${CREDENTIALS_DIRECTORY}/probe-token"
+# token_env = "BUFFMON_PROBE_TOKEN"     # alternative for containers
+# proxy = "http://proxy.lab.example:3128"
+
+[defaults]
+timeout_ms = 2000
+app_class = "bulk"
+
+# --- Access segment: is the LAN up? (reachability only) ----------------------
+[[icmp]]
+name = "lan-gateway"
+target = "10.1.1.1"
+pps = 1
+
+# --- Branch edge: EdgeConnect LAN interface (if your policy answers ICMP) -----
+[[icmp]]
+name = "ec-lan"
+target = "10.1.1.2"
+pps = 1
+
+# --- Overlay: STAMP to a DC reflector, one session per business-intent overlay.
+# DSCP must match what the overlay policy classifies on, or the probe takes a
+# different path from the traffic it stands for. Fixed source ports keep the
+# 5-tuple stable so Phase 2 can find the probe in EdgeConnect IPFIX.
+[[stamp]]
+name = "dc1-voice"
+target = "10.10.0.20:862"
+source = "0.0.0.0:40001"
+pps = 10                     # 300 packets per 30 s window → loss resolvable to ~1%
+dscp = 46                    # EF
+app_class = "voice"
+
+[[stamp]]
+name = "dc1-video"
+target = "10.10.0.20:862"
+source = "0.0.0.0:40002"
+pps = 10
+dscp = 34                    # AF41
+app_class = "video"
+
+[[stamp]]
+name = "dc1-default"
+target = "10.10.0.20:862"
+source = "0.0.0.0:40003"
+pps = 5
+dscp = 0
+app_class = "bulk"
+
+# A third-party reflector (e.g. a router's STAMP/TWAMP-light responder) is
+# usually stateless: the forward/return split is then not reported.
+# [[stamp]]
+# name = "core-rtr"
+# target = "10.10.0.1:862"
+# stateful_reflector = false
+
+# --- SSE path to SaaS: TCP handshake through the SSE tunnel ------------------
+[[tcp]]
+name = "m365-exchange"
+target = "outlook.office365.com:443"
+interval_ms = 5000
+app_class = "interactive"
+
+[[tcp]]
+name = "salesforce"
+target = "login.salesforce.com:443"
+interval_ms = 10000
+app_class = "interactive"
