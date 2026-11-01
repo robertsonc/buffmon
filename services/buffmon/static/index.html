@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>buffmon live</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%230b7a75'/%3E%3Cpath d='M5 19h5l3-9 5 14 3-8h6' fill='none' stroke='white' stroke-width='2.6' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/static/style.css">
+  <script src="/static/theme.js"></script>
+</head>
+<body>
+  <header class="top">
+    <div class="top-inner">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 16 16"><path d="M1.5 9.5h2.6l1.6-4.6 2.6 7.2 1.6-4h4.6" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </span>
+        <h1>buffmon</h1>
+        <span class="sub">Live network experience · synthetic probes</span>
+      </div>
+      <div class="chips" id="chips" role="group" aria-label="Filter by status"></div>
+      <span class="conn" id="conn"><span class="dot"></span><span id="conn-text">Connecting…</span></span>
+      <button class="btn" id="theme" type="button" aria-label="Toggle colour theme">Theme</button>
+      <form class="inline" method="post" action="/logout" id="logout-form"><button class="btn" type="submit">Sign out</button></form>
+    </div>
+  </header>
+
+  <div class="toolbar">
+    <input class="search" id="search" type="search" placeholder="Filter by site, session, target or probe" autocomplete="off">
+    <select class="btn" id="class-filter" aria-label="Application class">
+      <option value="">All app classes</option>
+    </select>
+    <select class="btn" id="kind-filter" aria-label="Probe type">
+      <option value="">All probe types</option>
+      <option value="stamp">STAMP (quality)</option>
+      <option value="tcp">TCP connect</option>
+      <option value="icmp">ICMP (reachability)</option>
+    </select>
+    <div class="legend" aria-hidden="true">
+      <span><i class="l-p50"></i>RTT p50 (5 min)</span>
+      <span><i class="l-loss"></i>loss</span>
+      <span>Windows: RTT/jitter 10 s · loss 30 s</span>
+    </div>
+  </div>
+
+  <main id="main">
+    <div class="empty" id="empty" hidden>
+      <h2>Waiting for probe data</h2>
+      <div>No probe has reported yet. Start a probe pointed at this server, or run the simulator:
+        <div class="empty-cmd"><code>buffmon-simulate --tokens-file &lt;tokens.json&gt; --probes 4</code></div>
+      </div>
+    </div>
+    <div id="sites"></div>
+  </main>
+
+  <div class="scrim" id="scrim" hidden></div>
+  <aside class="drawer" id="drawer" hidden role="dialog" aria-modal="true" aria-labelledby="d-title">
+    <div class="drawer-head">
+      <div>
+        <h2 id="d-title"></h2>
+        <div class="muted" id="d-sub"></div>
+      </div>
+      <button class="btn close" id="d-close" type="button" aria-label="Close detail">Close</button>
+    </div>
+    <section>
+      <span class="pill" id="d-pill"></span>
+      <ul class="reasons" id="d-reasons"></ul>
+    </section>
+    <section>
+      <h3>Live · last 15 minutes</h3>
+      <canvas class="chart" id="d-live"></canvas>
+    </section>
+    <section>
+      <h3>Rolling windows</h3>
+      <table class="win" id="d-windows"></table>
+    </section>
+    <section>
+      <div class="hist-head">
+        <h3>History</h3>
+        <div class="tabs" role="tablist" id="d-tabs">
+          <button class="tab" role="tab" data-range="1h" aria-selected="true">1h</button>
+          <button class="tab" role="tab" data-range="6h" aria-selected="false">6h</button>
+          <button class="tab" role="tab" data-range="24h" aria-selected="false">24h</button>
+          <button class="tab" role="tab" data-range="7d" aria-selected="false">7d</button>
+        </div>
+      </div>
+      <canvas class="chart" id="d-hist"></canvas>
+      <div class="hist-note" id="d-hist-note"></div>
+    </section>
+    <section>
+      <h3>Session</h3>
+      <dl class="kv" id="d-meta"></dl>
+    </section>
+  </aside>
+
+  <script src="/static/chart.js"></script>
+  <script src="/static/app.js"></script>
+</body>
+</html>

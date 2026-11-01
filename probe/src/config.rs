@@ -1,0 +1,392 @@
+//! Probe configuration (TOML). Secrets never live here: the ingest token comes
+//! from a file (systemd `LoadCredential=`) or an environment variable.
+
+use serde::Deserialize;
+use std::collections::HashSet;
+use std::net::{Ipv4Addr, SocketAddrV4};
+use std::path::Path;
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProbeConfig {
+    pub probe_id: String,
+    pub site: String,
+    pub output: OutputSection,
+    #[serde(default)]
+    pub defaults: Defaults,
+    #[serde(default)]
+    pub stamp: Vec<StampTarget>,
+    #[serde(default)]
+    pub icmp: Vec<IcmpTarget>,
+    #[serde(default)]
+    pub tcp: Vec<TcpTarget>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OutputSection {
+    /// e.g. `https://ingest.lab.example:8443/v1/probe/results`. Omit to only print.
+    pub url: Option<String>,
+    /// Path to a file holding the token. `${VAR}` is expanded, so
+    /// `${CREDENTIALS_DIRECTORY}/probe-token` works with systemd credentials.
+    pub token_file: Option<String>,
+    /// Name of an environment variable holding the token.
+    pub token_env: Option<String>,
+    /// Explicit HTTP(S) proxy, e.g. `http://proxy.lab:3128`.
+    pub proxy: Option<String>,
+    /// Plain HTTP is refused except to localhost unless this is set.
+    #[serde(default)]
+    pub allow_insecure_http: bool,
+    #[serde(default = "d_batch_ms")]
+    pub batch_ms: u64,
+    #[serde(default = "d_max_batch")]
+    pub max_batch: usize,
+    #[serde(default = "d_queue_max")]
+    pub queue_max: usize,
+    #[serde(default = "d_http_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Defaults {
+    #[serde(default = "d_timeout_ms")]
+    pub timeout_ms: u64,
+    #[serde(default = "d_app_class")]
+    pub app_class: String,
+}
+
+impl Default for Defaults {
+    fn default() -> Self {
+        Self { timeout_ms: d_timeout_ms(), app_class: d_app_class() }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StampTarget {
+    pub name: String,
+    /// `ip` or `ip:port` (port defaults to 862).
+    pub target: String,
+    /// Fixed source `ip:port` so the 5-tuple is stable for IPFIX matching.
+    pub source: Option<String>,
+    #[serde(default = "d_stamp_pps")]
+    pub pps: f64,
+    #[serde(default)]
+    pub dscp: u8,
+    pub app_class: Option<String>,
+    #[serde(default = "d_stamp_size")]
+    pub size: usize,
+    pub timeout_ms: Option<u64>,
+    /// Set false for third-party (stateless) reflectors; the forward/return
+    /// loss split is then not reported.
+    #[serde(default = "d_true")]
+    pub stateful_reflector: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IcmpTarget {
+    pub name: String,
+    pub target: Ipv4Addr,
+    #[serde(default = "d_icmp_pps")]
+    pub pps: f64,
+    #[serde(default)]
+    pub dscp: u8,
+    pub app_class: Option<String>,
+    pub timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TcpTarget {
+    pub name: String,
+    /// `host:port`; resolved on every attempt.
+    pub target: String,
+    #[serde(default = "d_tcp_interval_ms")]
+    pub interval_ms: u64,
+    #[serde(default)]
+    pub dscp: u8,
+    pub app_class: Option<String>,
+    /// Connect timeout.
+    pub timeout_ms: Option<u64>,
+}
+
+fn d_batch_ms() -> u64 {
+    1000
+}
+fn d_max_batch() -> usize {
+    1000
+}
+fn d_queue_max() -> usize {
+    20_000
+}
+fn d_http_timeout_ms() -> u64 {
+    10_000
+}
+fn d_timeout_ms() -> u64 {
+    2000
+}
+fn d_app_class() -> String {
+    "bulk".to_string()
+}
+fn d_stamp_pps() -> f64 {
+    10.0
+}
+fn d_stamp_size() -> usize {
+    crate::stamp::BASE_LEN
+}
+fn d_icmp_pps() -> f64 {
+    1.0
+}
+fn d_tcp_interval_ms() -> u64 {
+    5000
+}
+fn d_true() -> bool {
+    true
+}
+
+fn valid_name(s: &str, max: usize) -> bool {
+    !s.is_empty() && s.len() <= max && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
+fn valid_app_class(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 32
+        && s.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '_' | '-'))
+}
+
+pub fn parse_v4_endpoint(s: &str, default_port: u16) -> Result<SocketAddrV4, String> {
+    if let Ok(a) = s.parse::<SocketAddrV4>() {
+        return Ok(a);
+    }
+    if let Ok(ip) = s.parse::<Ipv4Addr>() {
+        return Ok(SocketAddrV4::new(ip, default_port));
+    }
+    Err(format!("{s:?} is not an IPv4 address or ip:port"))
+}
+
+impl ProbeConfig {
+    pub fn load(path: &Path) -> Result<Self, String> {
+        let raw = std::fs::read_to_string(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+        let cfg: ProbeConfig = toml::from_str(&raw).map_err(|e| format!("{}: {e}", path.display()))?;
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if !valid_name(&self.probe_id, 64) {
+            return Err(format!("probe_id {:?}: 1-64 chars of [A-Za-z0-9._-]", self.probe_id));
+        }
+        if self.site.is_empty() || self.site.len() > 64 {
+            return Err("site: 1-64 characters".into());
+        }
+        if !valid_app_class(&self.defaults.app_class) {
+            return Err(format!("defaults.app_class {:?}: 1-32 chars of [a-z0-9_-]", self.defaults.app_class));
+        }
+        check_timeout("defaults.timeout_ms", self.defaults.timeout_ms)?;
+
+        let mut names = HashSet::new();
+        let mut check_common =
+            |kind: &str, name: &str, dscp: u8, app: &Option<String>, timeout: Option<u64>| -> Result<(), String> {
+                if !valid_name(name, 64) {
+                    return Err(format!("{kind} name {name:?}: 1-64 chars of [A-Za-z0-9._-]"));
+                }
+                if !names.insert(name.to_string()) {
+                    return Err(format!("session name {name:?} is used twice"));
+                }
+                if dscp > 63 {
+                    return Err(format!("{kind} {name}: dscp must be 0-63"));
+                }
+                if let Some(a) = app {
+                    if !valid_app_class(a) {
+                        return Err(format!("{kind} {name}: app_class {a:?}: 1-32 chars of [a-z0-9_-]"));
+                    }
+                }
+                if let Some(t) = timeout {
+                    check_timeout(&format!("{kind} {name}: timeout_ms"), t)?;
+                }
+                Ok(())
+            };
+
+        for s in &self.stamp {
+            check_common("stamp", &s.name, s.dscp, &s.app_class, s.timeout_ms)?;
+            parse_v4_endpoint(&s.target, crate::stamp::PORT).map_err(|e| format!("stamp {}: target {e}", s.name))?;
+            if let Some(src) = &s.source {
+                parse_v4_endpoint(src, 0).map_err(|e| format!("stamp {}: source {e}", s.name))?;
+            }
+            check_pps(&format!("stamp {}", s.name), s.pps)?;
+            if !(crate::stamp::BASE_LEN..=crate::stamp::MAX_LEN).contains(&s.size) {
+                return Err(format!(
+                    "stamp {}: size must be {}-{}",
+                    s.name,
+                    crate::stamp::BASE_LEN,
+                    crate::stamp::MAX_LEN
+                ));
+            }
+        }
+        for s in &self.icmp {
+            check_common("icmp", &s.name, s.dscp, &s.app_class, s.timeout_ms)?;
+            check_pps(&format!("icmp {}", s.name), s.pps)?;
+        }
+        for s in &self.tcp {
+            check_common("tcp", &s.name, s.dscp, &s.app_class, s.timeout_ms)?;
+            if !s.target.contains(':') {
+                return Err(format!("tcp {}: target must be host:port", s.name));
+            }
+            if !(500..=3_600_000).contains(&s.interval_ms) {
+                return Err(format!("tcp {}: interval_ms must be 500-3600000", s.name));
+            }
+        }
+        if names.is_empty() {
+            return Err("no sessions configured ([[stamp]], [[icmp]] or [[tcp]])".into());
+        }
+
+        let o = &self.output;
+        if let Some(url) = &o.url {
+            let lower = url.to_ascii_lowercase();
+            let local = ["http://127.0.0.1", "http://localhost", "http://[::1]"].iter().any(|p| lower.starts_with(p));
+            if lower.starts_with("http://") && !local && !o.allow_insecure_http {
+                return Err(
+                    "output.url is plain HTTP to a non-local host; use HTTPS or set allow_insecure_http = true".into(),
+                );
+            }
+            if !lower.starts_with("http://") && !lower.starts_with("https://") {
+                return Err("output.url must be http(s)://".into());
+            }
+            if o.token_file.is_none() && o.token_env.is_none() {
+                return Err("output.url needs token_file or token_env".into());
+            }
+        }
+        if !(100..=60_000).contains(&o.batch_ms) || !(1..=5000).contains(&o.max_batch) || o.queue_max < o.max_batch {
+            return Err("output: batch_ms 100-60000, max_batch 1-5000, queue_max >= max_batch".into());
+        }
+        if !(1000..=120_000).contains(&o.timeout_ms) {
+            return Err("output.timeout_ms must be 1000-120000".into());
+        }
+        Ok(())
+    }
+
+    pub fn app_class<'a>(&'a self, specific: &'a Option<String>) -> &'a str {
+        specific.as_deref().unwrap_or(&self.defaults.app_class)
+    }
+
+    pub fn timeout_ms(&self, specific: Option<u64>) -> u64 {
+        specific.unwrap_or(self.defaults.timeout_ms)
+    }
+}
+
+fn check_timeout(what: &str, t: u64) -> Result<(), String> {
+    if (100..=30_000).contains(&t) {
+        Ok(())
+    } else {
+        Err(format!("{what} must be 100-30000"))
+    }
+}
+
+fn check_pps(what: &str, pps: f64) -> Result<(), String> {
+    if pps.is_finite() && pps > 0.0 && pps <= 1000.0 {
+        Ok(())
+    } else {
+        Err(format!("{what}: pps must be > 0 and <= 1000"))
+    }
+}
+
+/// Expands `${VAR}` references using the process environment.
+pub fn expand_env(s: &str) -> Result<String, String> {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(start) = rest.find("${") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let end = after.find('}').ok_or_else(|| format!("unterminated ${{ in {s:?}"))?;
+        let var = &after[..end];
+        let val = std::env::var(var).map_err(|_| format!("environment variable {var} is not set (needed by {s:?})"))?;
+        out.push_str(&val);
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    Ok(out)
+}
+
+/// Resolves the ingest token from `token_file` or `token_env`.
+pub fn resolve_token(o: &OutputSection) -> Result<String, String> {
+    if let Some(path) = &o.token_file {
+        let path = expand_env(path)?;
+        check_private(Path::new(&path));
+        let token = std::fs::read_to_string(&path).map_err(|e| format!("cannot read token file {path}: {e}"))?;
+        let token = token.trim().to_string();
+        if token.is_empty() {
+            return Err(format!("token file {path} is empty"));
+        }
+        return Ok(token);
+    }
+    if let Some(var) = &o.token_env {
+        let token = std::env::var(var).map_err(|_| format!("environment variable {var} (token_env) is not set"))?;
+        if token.trim().is_empty() {
+            return Err(format!("environment variable {var} is empty"));
+        }
+        return Ok(token.trim().to_string());
+    }
+    Err("no token_file or token_env configured".into())
+}
+
+fn check_private(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(meta) = std::fs::metadata(path) {
+        if meta.permissions().mode() & 0o077 != 0 {
+            log::warn!("token file {} is readable by group/others; chmod 600 it", path.display());
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MIN: &str = r#"
+        probe_id = "sjc-br01-p1"
+        site = "SJC-BR01"
+        [output]
+        url = "https://ingest.example:8443/v1/probe/results"
+        token_env = "BUFFMON_TOKEN"
+        [[stamp]]
+        name = "dc1-voice"
+        target = "10.10.0.20"
+        dscp = 46
+        app_class = "voice"
+    "#;
+
+    #[test]
+    fn minimal_config_parses_with_defaults() {
+        let c: ProbeConfig = toml::from_str(MIN).unwrap();
+        c.validate().unwrap();
+        assert_eq!(c.stamp[0].pps, 10.0);
+        assert_eq!(c.stamp[0].size, 44);
+        assert!(c.stamp[0].stateful_reflector);
+        assert_eq!(parse_v4_endpoint(&c.stamp[0].target, 862).unwrap().port(), 862);
+        assert_eq!(c.timeout_ms(None), 2000);
+    }
+
+    #[test]
+    fn rejects_unknown_fields_bad_dscp_duplicates_and_plain_http() {
+        assert!(toml::from_str::<ProbeConfig>(&MIN.replace("dscp = 46", "dscp = 46\nbogus = 1")).is_err());
+        let c: ProbeConfig = toml::from_str(&MIN.replace("dscp = 46", "dscp = 64")).unwrap();
+        assert!(c.validate().is_err());
+        let dup = format!("{MIN}\n[[icmp]]\nname = \"dc1-voice\"\ntarget = \"10.0.0.1\"\n");
+        let c: ProbeConfig = toml::from_str(&dup).unwrap();
+        assert!(c.validate().unwrap_err().contains("twice"));
+        let c: ProbeConfig = toml::from_str(&MIN.replace("https://ingest.example", "http://ingest.example")).unwrap();
+        assert!(c.validate().unwrap_err().contains("plain HTTP"));
+        let c: ProbeConfig =
+            toml::from_str(&MIN.replace("https://ingest.example:8443", "http://127.0.0.1:8080")).unwrap();
+        c.validate().unwrap();
+    }
+
+    #[test]
+    fn expand_env_substitutes_and_reports_missing() {
+        std::env::set_var("BUFFMON_TEST_DIR", "/run/creds");
+        assert_eq!(expand_env("${BUFFMON_TEST_DIR}/probe-token").unwrap(), "/run/creds/probe-token");
+        assert!(expand_env("${BUFFMON_DEFINITELY_UNSET}/x").is_err());
+    }
+}

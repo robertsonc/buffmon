@@ -1,0 +1,41 @@
+[package]
+name = "buffmon-probe"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+publish = false
+description = "buffmon site probe (STAMP, ICMP, TCP) and STAMP reflector for Linux"
+
+[lib]
+name = "buffmon_probe"
+path = "src/lib.rs"
+
+[[bin]]
+name = "buffmon-probe"
+path = "src/bin/buffmon-probe.rs"
+
+[[bin]]
+name = "buffmon-reflector"
+path = "src/bin/buffmon-reflector.rs"
+
+[dependencies]
+env_logger = { version = "0.11", default-features = false, features = ["humantime"] }
+flate2 = "1"
+libc = "0.2"
+log = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+socket2 = { version = "0.5", features = ["all"] }
+toml = "0.8"
+# rustls with the OS trust store (enterprise CAs work) and explicit-proxy support.
+ureq = { version = "2.12", default-features = false, features = ["tls", "native-certs"] }
+
+[profile.release]
+# Timing code: optimise for speed, not size.
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+# A panicking session thread must take the process down so systemd restarts it
+# visibly, rather than silently leaving one session dead.
+panic = "abort"
+strip = true
