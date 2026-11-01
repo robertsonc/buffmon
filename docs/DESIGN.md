@@ -196,6 +196,11 @@ Per session, over rolling windows:
   an identity-aware proxy in front for production.
 - Every external integration is read-only. Probe traffic on a non-lab network
   needs an explicit go-ahead: packet trains (P3) are bursty by design.
+- Orchestrator: GET only, except reads that exist only as POST. Each of those is
+  a rule in `deploy/orchestrator/post-allowlist.yaml` (`effect: read` only;
+  exact path; typed limits on every parameter and body key; approver and the
+  releases it was verified on), enforced before sending and again on the wire.
+  No policy, no POST; `--deny-posts` is the kill switch.
 
 ## 10. Phases
 
@@ -212,9 +217,10 @@ Per session, over rolling windows:
 
 - Done: per-target threshold overrides; flow pipeline (standard IPFIX
   elements) with exporter allowlist and probe path validation; Orchestrator
-  10.x tunnel stats, verified against a live 10.0.0.40724 Orchestrator
-  (`deploy/orchestrator/README.md`); tunnel health on the dashboard and next to
-  each probe's path.
+  10.x tunnel stats and alarms, verified against a live 10.0.0.40724
+  Orchestrator (`deploy/orchestrator/README.md`); tunnel health on the
+  dashboard and next to each probe's path; the POST allowlist and its review
+  tool (`buffmon-orch-policy`).
 - Deviation: no Redpanda yet. One collector process writes straight to
   ClickHouse with the same batching and dedup guarantees as ingest; the bus
   comes in when there is more than one collector or the flow rate needs it.

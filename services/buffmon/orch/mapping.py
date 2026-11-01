@@ -32,7 +32,8 @@ from urllib.parse import quote
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
-from .client import READ_ONLY_POSTS, dig
+from .client import dig
+from .post_policy import PostPolicy
 
 FieldType = Literal["datetime", "str", "float", "int"]
 Convert = Literal[
@@ -156,13 +157,14 @@ class Collector(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     enabled: bool = False
-    # GET, or POST for an endpoint in client.READ_ONLY_POSTS (reads Orchestrator
-    # only offers as POST). Any other POST fails validation and is refused by
-    # the client before sending.
+    # GET, or POST under a rule of the POST policy (post-allowlist.yaml): a read
+    # Orchestrator only offers as POST. The rule, not the mapping, decides what
+    # the request may contain; the client refuses anything else before sending.
     method: Literal["GET", "POST"] = "GET"
+    post_rule: str | None = None
     path: str | None = None
     params: dict[str, str | int | float | bool] = {}
-    # JSON body for an approved read-only POST. A string value that is exactly
+    # JSON body for a POST-policy collector. A string value that is exactly
     # "{appliance_ids}" becomes the list of inventory appliance ids (sent in
     # chunks of `body_chunk`).
     body: dict[str, Any] | None = None
@@ -251,13 +253,12 @@ class MappingFile(BaseModel):
                 problems.append(f"{where} path placeholders {sorted(placeholders - FAN_OUT_FIELDS)} "
                                 f"are not inventory fields ({', '.join(sorted(FAN_OUT_FIELDS))})")
             if col.method == "POST":
-                if col.path not in READ_ONLY_POSTS:
-                    problems.append(f"{where} method POST is only allowed for the approved read-only POSTs "
-                                    f"({', '.join(sorted(READ_ONLY_POSTS))}); {col.path!r} is not one of them")
+                if not col.post_rule:
+                    problems.append(f"{where} method POST needs post_rule: the id of a rule in the POST policy")
                 if col.body is None:
                     problems.append(f"{where} method POST needs a body")
-            elif col.body is not None:
-                problems.append(f"{where} a GET collector cannot have a body")
+            elif col.body is not None or col.post_rule is not None:
+                problems.append(f"{where} a GET collector cannot have a body or post_rule")
             if _uses_appliance_ids(col.body):
                 inv = self.collectors.get("appliances")
                 if inv is None or not inv.enabled:
@@ -491,3 +492,48 @@ def render_path(template: str, ctx: Mapping[str, Any]) -> str:
         return quote(str(value), safe="")
 
     return _PLACEHOLDER.sub(sub, template)
+
+
+def check_against_policy(mapping: MappingFile, policy: PostPolicy) -> list[str]:
+    """Problems with the mapping's POST collectors under ``policy`` (empty: all fit).
+
+    Run at poller start-up, so a mapping that asks for more than its rule allows,
+    or targets a release the rule was not verified on, fails before any request
+    instead of being refused one request at a time."""
+    problems: list[str] = []
+    for name, col in mapping.enabled().items():
+        if col.method != "POST":
+            continue
+        where = f"collectors.{name} (POST rule {col.post_rule!r})"
+        rule = policy.rule(col.post_rule or "")
+        if rule is None:
+            have = ", ".join(r.id for r in policy.rules) or "no rules"
+            problems.append(f"{where}: the rule is not in the POST policy (policy has: {have})")
+            continue
+        if col.path != rule.path:
+            problems.append(f"{where}: path {col.path!r} differs from the rule's {rule.path!r}")
+        mv = mapping.orchestrator_version
+        if not any(v == mv or v.startswith(mv + ".") for v in rule.verified_on):
+            problems.append(f"{where}: the rule was verified on {', '.join(rule.verified_on)}, not on this "
+                            f"mapping's Orchestrator {mv}; re-verify the operation there and add the release "
+                            f"to verified_on")
+        for k, v in col.params.items():
+            vr = rule.params.get(k)
+            if vr is None:
+                problems.append(f"{where}: query parameter {k!r} is not allowed by the rule")
+            elif not (isinstance(v, str) and _PLACEHOLDER.search(v)) and (why := vr.check(k, v)):
+                problems.append(f"{where}: {why}")
+        for k, v in (col.body or {}).items():
+            vr = rule.body.get(k)
+            if vr is None:
+                problems.append(f"{where}: body key {k!r} is not allowed by the rule")
+            elif v == APPLIANCE_IDS:
+                if vr.type != "list_of_string":
+                    problems.append(f"{where}: body key {k!r} gets the appliance id list, but the rule types "
+                                    f"it as {vr.type}")
+                elif vr.max_items is not None and col.body_chunk > vr.max_items:
+                    problems.append(f"{where}: body_chunk {col.body_chunk} exceeds the rule's max_items "
+                                    f"{vr.max_items} for {k!r}")
+            elif (why := vr.check(k, v)) is not None:
+                problems.append(f"{where}: {why}")
+    return problems

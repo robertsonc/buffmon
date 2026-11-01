@@ -39,7 +39,8 @@ Choices in the 10.x mapping:
 - Loss is stored as **packet counts** before and after FEC (additive) and as
   Orchestrator's per-minute percentage. The percentage scale is the export's
   ("Packet loss percentage"); the lab had no loss to confirm it against.
-- **Alarms** use `POST /alarm/appliance` (the approved read-only POST) with the
+- **Alarms** use `POST /alarm/appliance` (rule `alarm-appliance-read` of the
+  POST policy, below) with the
   inventory's appliance ids in the body, `view=active`, every minute. LIVE: the
   API's `source` is the affected object (prefix, tunnel, BGP peer), not the
   subsystem the export describes; `type` is the category (SW, TUN, ...); `name`
@@ -55,10 +56,10 @@ Choices in the 10.x mapping:
   exceptions, both explicit:
   - the login request you declare in `auth.login` (if your release uses session
     login rather than an API token), sent once per login and never retried;
-  - `READ_ONLY_POSTS` in `buffmon/orch/client.py`: reads that Orchestrator only
-    offers as POST. Today exactly one, `POST /alarm/appliance` (approved by the
-    deployment owner 2026-11-01). The list lives in code, so a mapping edit
-    cannot add to it; a mapping that declares any other POST fails validation.
+  - the **POST policy**, `post-allowlist.yaml`: reads that Orchestrator only
+    offers as POST. Today exactly one rule, `alarm-appliance-read`
+    (`POST /alarm/appliance`, approved by the deployment owner 2026-11-01).
+    See "Allowing a new POST" below.
 - **Nothing is guessed.** No endpoint path, query parameter, header name or
   response field is built into the code. They come from your Orchestrator's own
   Swagger/OpenAPI export, release by release.
@@ -115,8 +116,13 @@ export BUFFMON_ORCH_URL=https://<orchestrator>
 export BUFFMON_ORCH_TOKEN_FILE=/etc/buffmon/orch-token        # chmod 600; for auth.mode: header
 # or BUFFMON_ORCH_USERNAME + BUFFMON_ORCH_PASSWORD_FILE         # for auth.mode: login
 export BUFFMON_ORCH_CA_BUNDLE=/etc/buffmon/orch-ca.pem         # if Orchestrator uses a private CA
+export BUFFMON_ORCH_POST_POLICY=/etc/buffmon/orchestrator/post-allowlist.yaml   # if a collector uses POST
 buffmon-orch-poll --mapping mapping.9.7.2.yaml --once --dry-run
 ```
+
+A mapping with an enabled POST collector will not start without the policy.
+`--deny-posts` (or `BUFFMON_ORCH_DENY_POSTS=1`) runs it anyway with every POST
+collector switched off: the kill switch if a POST is ever in doubt.
 
 `--dry-run` prints normalized rows as JSON lines and writes nothing. Check
 them against what the Orchestrator UI shows for the same tunnels, especially
@@ -133,3 +139,61 @@ Apply `deploy/clickhouse/003_tunnel_stats.sql`, then run without `--dry-run`
 `interval_s`). Re-polling the same sample is idempotent: rows are keyed by
 (appliance, tunnel_id, ts) and collapse on merge; a retried insert is dropped
 immediately by its dedup token.
+
+## Allowing a new POST
+
+Some Orchestrator reads exist only as POST (the query is in the body:
+`/alarm/appliance`, `/stats/aggregate/*` for many appliances, `.../getBatch`).
+The Orchestrator 10.0 export has 419 POST operations; most change something.
+buffmon sends one only when a rule in `post-allowlist.yaml` allows it.
+
+How a rule is enforced:
+
+| Where | What is checked |
+|---|---|
+| Loading the policy | `effect: read` (the only accepted value); exact path; typed limits on every query parameter and body key; approver, date, `verified_on`; the tripwire (below); the file is not group/world-writable |
+| Poller start-up | each POST collector names a rule (`post_rule`), uses the rule's path, sends only allowed keys within limits, and targets a release in the rule's `verified_on`; otherwise the poller exits before any request. The client gets only the rules the mapping uses. The policy's sha256 and each rule in use are logged |
+| Before each POST | the request (rendered parameters and body) fits the rule, body size included |
+| On the wire | the httpx request hook re-checks the path, query string and body bytes actually being sent; a POST without a rule is refused |
+
+**The tripwire.** A rule's path, spec operationId and spec summary are scanned
+for write-sounding words (`acknowledge`, `clear`, `delete`, `note`, `assign`,
+`init`, `store`, `increment`, ...), secret-sounding words (`config`, `key`,
+`token`, ...) and a missing read verb (`get`, `retrieve`, `list`, ...). Each
+flag must be listed under `reviewed_terms`, and nothing else may be. Over the
+10.0 export it leaves 53 of 419 POST operations unflagged, all statistics,
+state or inventory reads. It is a prompt to look harder, not proof: words cannot
+show that a call is read-only. The approval is the control.
+
+**Procedure.**
+
+1. Find the operation in your release's export and read it in the API
+   reference. Ask: does it change anything (state, counters, notes,
+   acknowledgements), trigger anything on an appliance (tests, pings, syncs), or
+   return secrets? If yes to any, stop: it does not belong in buffmon.
+2. Draft the rule from the export (the draft deliberately does not load):
+   ```bash
+   buffmon-orch-policy draft --spec orch-10.x.json --path /stats/aggregate/mos > rule.yaml
+   ```
+3. Complete it: add `effect: read`; delete every parameter and body key the
+   collector does not need and narrow the rest (`enum`, `min`/`max`, `pattern`,
+   `max_items`); fill `purpose`, `approved_by`, `approved_on`; copy the
+   tripwire flags from the draft header into `reviewed_terms` only after
+   confirming each one.
+4. Call it against a lab Orchestrator and add that release to `verified_on`.
+   A mapping for another release fails start-up until the rule is verified there.
+5. Reference it from the mapping collector (`method: POST`, `post_rule: <id>`,
+   same `path`).
+6. Check, then open a PR with the rule, the mapping change and the check output:
+   ```bash
+   buffmon-orch-policy check --policy post-allowlist.yaml --spec orch-10.x.json \
+       --mapping mapping.10.x.yaml --mapping mapping.9.7.2.yaml
+   ```
+   `check --spec` also catches drift after an upgrade: a changed summary or
+   operationId, a parameter or body key that no longer exists, or an enum or
+   limit wider than the spec's.
+7. Deploy the file root-owned, mode 0644, and confirm the new sha256 in the
+   poller's start-up log.
+
+Removing a rule is a one-line PR; `--deny-posts` stops every POST immediately
+without one.

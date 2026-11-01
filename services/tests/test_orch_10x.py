@@ -15,8 +15,10 @@ from pydantic import ValidationError
 
 from buffmon.orch.mapping import Buckets, MappingFile, bucket_context, load_mapping, normalize, render_params
 from buffmon.orch.poller import main
+from buffmon.orch.post_policy import load_policy
 
 DEPLOY = Path(__file__).resolve().parents[2] / "deploy" / "orchestrator"
+POLICY = DEPLOY / "post-allowlist.yaml"
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "orch" / "aggregate_tunnel_10x.json"
 MAPPING = load_mapping(DEPLOY / "mapping.10.x.yaml")
 
@@ -24,10 +26,11 @@ MAPPING = load_mapping(DEPLOY / "mapping.10.x.yaml")
 def test_shipped_10x_mapping_is_complete_and_get_only() -> None:
     assert MAPPING.auth.mode == "header" and MAPPING.auth.header_name == "X-Auth-Token"
     assert set(MAPPING.enabled()) == {"appliances", "tunnel_stats", "alarms"}
-    # Every collector is GET except alarms: the one approved read-only POST.
+    # Every collector is GET except alarms: a read sent under the POST policy.
     assert {n: c.method for n, c in MAPPING.collectors.items()} == \
         {"appliances": "GET", "tunnel_stats": "GET", "alarms": "POST"}
     assert MAPPING.collectors["alarms"].path == "/alarm/appliance"
+    assert MAPPING.collectors["alarms"].post_rule == "alarm-appliance-read"
     ts = MAPPING.collectors["tunnel_stats"]
     assert ts.fan_out == "appliances" and ts.buckets == Buckets(size_s=60, lag_s=120, count=3)
     # LIVE: seconds, not the milliseconds the export documents.
@@ -121,7 +124,8 @@ def test_poller_requests_against_the_shipped_mapping(tmp_path: Path, capsys: pyt
     token = tmp_path / "token"
     token.write_text("synthetic-token")
     code = main(["--mapping", str(DEPLOY / "mapping.10.x.yaml"), "--url", "https://orch.synthetic.invalid/gms/rest",
-                 "--token-file", str(token), "--once", "--dry-run"], transport=httpx.MockTransport(h))
+                 "--token-file", str(token), "--post-policy", str(POLICY), "--once", "--dry-run"],
+                transport=httpx.MockTransport(h))
     out = capsys.readouterr()
     assert code == 0, out.err
     assert all(r.method == "GET" or r.url.path == "/gms/rest/alarm/appliance" for r in seen)
@@ -136,7 +140,7 @@ def test_poller_requests_against_the_shipped_mapping(tmp_path: Path, capsys: pyt
     assert sum(1 for r in rows if r["collector"] == "tunnel_stats") == 2 * 3 * 3
 
 
-# -- approved read-only POST (/alarm/appliance) -----------------------------------------
+# -- POST /alarm/appliance under rule alarm-appliance-read ------------------------------
 
 ALARMS_FIXTURE = Path(__file__).resolve().parent / "fixtures" / "orch" / "alarm_appliance_10x.json"
 
@@ -149,39 +153,92 @@ def _client(handler: Any) -> Any:
     return OrchClient(
         ClientConfig(base_url="https://orch.synthetic.invalid/gms/rest",
                      auth=AuthConfig(mode="header", header_name="X-Auth-Token", token=SecretStr("synthetic-token")),
-                     backoff_base_s=0.0, backoff_max_s=0.0),
+                     backoff_base_s=0.0, backoff_max_s=0.0, post_policy=load_policy(POLICY)),
         transport=httpx.MockTransport(handler),
     )
 
 
-def test_only_the_approved_post_path_can_be_sent() -> None:
+async def _stream() -> Any:
+    yield b'{"nePks": ["1.NE"]}'
+
+
+def test_only_requests_that_fit_the_rule_are_sent() -> None:
     import asyncio
 
-    from buffmon.orch.client import READ_ONLY_POSTS, ReadOnlyViolationError
+    from buffmon.orch.client import POST_RULE_EXTENSION, ReadOnlyViolationError
 
-    assert frozenset({"/alarm/appliance"}) == READ_ONLY_POSTS, "adding a POST needs explicit approval"
     seen: list[httpx.Request] = []
 
     def h(r: httpx.Request) -> httpx.Response:
         seen.append(r)
         return httpx.Response(200, json=[])
 
+    rule = "alarm-appliance-read"
+    ext = {POST_RULE_EXTENSION: rule}
+
     async def go() -> None:
         c = _client(h)
         try:
-            assert await c.post_read_json("/alarm/appliance", {"view": "active"}, {"nePks": ["1.NE"]}) == []
-            with pytest.raises(ReadOnlyViolationError):
-                await c.post_read_json("/alarm/acknowledgement/appliance", None, {"ids": [1]})
-            with pytest.raises(ReadOnlyViolationError):  # the request hook, if anything bypasses post_read_json
-                await c._client.post("/alarm/clearance/appliance", json={})
-            with pytest.raises(ReadOnlyViolationError):  # same path, but outside the API base
-                await c._client.post("https://orch.synthetic.invalid/other/alarm/appliance", json={})
+            assert await c.post_json(rule, {"view": "active", "maxAlarms": 5000}, {"nePks": ["1.NE"]}) == []
+            refused = [
+                c.post_json("alarm-acknowledge", None, {"ids": [1]}),                    # no such rule
+                c.post_json(rule, {"view": "acknowledged"}, {"nePks": ["1.NE"]}),        # not in the enum
+                c.post_json(rule, {"maxAlarms": 0}, {"nePks": ["1.NE"]}),                # below min
+                c.post_json(rule, {"acknowledge": "true"}, {"nePks": ["1.NE"]}),         # unknown parameter
+                c.post_json(rule, None, {"nePks": ["1.NE"], "action": "clear"}),         # unknown body key
+                c.post_json(rule, None, {"nePks": ["1.NE; DROP"]}),                      # pattern
+                c.post_json(rule, None, {"nePks": [f"{i}.NE" for i in range(1001)]}),    # max_items
+                c.post_json(rule, None, {}),                                             # required key
+                c.post_json(rule, None, ["1.NE"]),                                       # not an object
+                # The request hook, for anything that bypasses post_json:
+                c._client.post("/alarm/clearance/appliance", json={}),                   # no rule
+                c._client.post("/alarm/note/appliance", json={"nePks": ["1.NE"]}, extensions=ext),  # wrong path
+                c._client.post("https://orch.synthetic.invalid/other/alarm/appliance",              # outside API base
+                               json={"nePks": ["1.NE"]}, extensions=ext),
+                c._client.post("/alarm/appliance", params={"view": "active", "x": "1"},             # extra parameter
+                               json={"nePks": ["1.NE"]}, extensions=ext),
+                c._client.post("/alarm/appliance", params=[("view", "active"), ("view", "all")],    # repeated parameter
+                               json={"nePks": ["1.NE"]}, extensions=ext),
+                c._client.post("/alarm/appliance", content=b"nePks=1.NE", extensions=ext),          # not JSON
+                c._client.post("/alarm/appliance", content=_stream(), extensions=ext),              # streamed
+            ]
+            for i, coro in enumerate(refused):
+                with pytest.raises(ReadOnlyViolationError):
+                    await coro
+                assert len(seen) == 1, f"refused request {i} reached the server"
         finally:
             await c.aclose()
 
     asyncio.run(go())
     assert [(r.method, r.url.path) for r in seen] == [("POST", "/gms/rest/alarm/appliance")]
     assert json.loads(seen[0].content) == {"nePks": ["1.NE"]}
+
+
+def test_no_policy_means_no_post() -> None:
+    import asyncio
+
+    from pydantic import SecretStr
+
+    from buffmon.orch.client import POST_RULE_EXTENSION, AuthConfig, ClientConfig, OrchClient, ReadOnlyViolationError
+
+    seen: list[httpx.Request] = []
+    c = OrchClient(ClientConfig(base_url="https://orch.synthetic.invalid/gms/rest",
+                                auth=AuthConfig(mode="header", header_name="X-Auth-Token",
+                                                token=SecretStr("synthetic-token"))),
+                   transport=httpx.MockTransport(lambda r: seen.append(r) or httpx.Response(200, json=[])))
+
+    async def go() -> None:
+        try:
+            with pytest.raises(ReadOnlyViolationError, match="no rules"):
+                await c.post_json("alarm-appliance-read", None, {"nePks": ["1.NE"]})
+            with pytest.raises(ReadOnlyViolationError):
+                await c._client.post("/alarm/appliance", json={"nePks": ["1.NE"]},
+                                     extensions={POST_RULE_EXTENSION: "alarm-appliance-read"})
+        finally:
+            await c.aclose()
+
+    asyncio.run(go())
+    assert seen == []
 
 
 def test_approved_post_is_retried_like_a_read() -> None:
@@ -196,7 +253,7 @@ def test_approved_post_is_retried_like_a_read() -> None:
     async def go() -> Any:
         c = _client(h)
         try:
-            return await c.post_read_json("/alarm/appliance", None, {"nePks": ["1.NE"]})
+            return await c.post_json("alarm-appliance-read", None, {"nePks": ["1.NE"]})
         finally:
             await c.aclose()
 
@@ -204,9 +261,10 @@ def test_approved_post_is_retried_like_a_read() -> None:
 
 
 @pytest.mark.parametrize("collector,match", [
-    ({"method": "POST", "path": "/synthetic/alarms", "body": {"x": 1}}, "approved read-only POSTs"),
-    ({"method": "POST", "path": "/alarm/appliance"}, "needs a body"),
+    ({"method": "POST", "path": "/synthetic/alarms", "body": {"x": 1}}, "needs post_rule"),
+    ({"method": "POST", "path": "/alarm/appliance", "post_rule": "r-1"}, "needs a body"),
     ({"method": "GET", "path": "/synthetic/alarms", "body": {"x": 1}}, "cannot have a body"),
+    ({"method": "GET", "path": "/synthetic/alarms", "post_rule": "r-1"}, "cannot have a body or post_rule"),
     ({"method": "POST", "path": "/alarm/appliance", "body": {"nePks": "{appliance_ids}"}}, "appliances collector"),
 ])
 def test_post_collectors_are_validated(collector: dict[str, Any], match: str) -> None:
@@ -248,7 +306,8 @@ def test_alarm_post_sends_inventory_ids_in_chunks(tmp_path: Path, capsys: pytest
     token = tmp_path / "token"
     token.write_text("synthetic-token")
     code = main(["--mapping", str(mapping), "--url", "https://orch.synthetic.invalid/gms/rest",
-                 "--token-file", str(token), "--once", "--dry-run"], transport=httpx.MockTransport(h))
+                 "--token-file", str(token), "--post-policy", str(POLICY), "--once", "--dry-run"],
+                transport=httpx.MockTransport(h))
     assert code == 0, capsys.readouterr().err
     posts = [r for r in seen if r.method == "POST"]
     assert [json.loads(r.content)["nePks"] for r in posts] == [["0.NE", "1.NE"], ["2.NE", "3.NE"], ["4.NE"]]

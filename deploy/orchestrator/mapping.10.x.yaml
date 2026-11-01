@@ -10,7 +10,9 @@
 #   buffmon-orch-discover <old export> --diff <new export>
 #   buffmon-orch-poll --mapping mapping.10.x.yaml --once --dry-run
 #
-# The client is read-only: every request below is a GET.
+# The client is read-only: every request below is a GET, except `alarms`, a
+# read that Orchestrator only offers as POST, sent under rule alarm-appliance-read
+# of post-allowlist.yaml (run the poller with --post-policy pointing at it).
 
 version: 1
 orchestrator_version: "10.0"
@@ -97,9 +99,10 @@ collectors:
       bytes_tx:           { from: SUM_WTX_BYTES }
       bytes_rx:           { from: SUM_WRX_BYTES }
 
-  # POST /alarm/appliance — a READ that Orchestrator only offers as POST. It is
-  # one of the client's code-level READ_ONLY_POSTS (approved by the deployment
-  # owner 2026-11-01); a POST to any other path is refused before sending.
+  # POST /alarm/appliance — a READ that Orchestrator only offers as POST, sent
+  # under rule alarm-appliance-read of post-allowlist.yaml. The rule, not this
+  # file, decides what the request may carry (path, parameters, body keys);
+  # anything else is refused before sending.
   # Body {"nePks": [...]} from the inventory, in chunks of body_chunk.
   # view=active each minute: the table shows what is active now (an alarm's
   # latest ingested_at says when it was last seen active). Closure history stays
@@ -107,6 +110,7 @@ collectors:
   alarms:
     enabled: true
     method: POST
+    post_rule: alarm-appliance-read
     path: /alarm/appliance
     params: { view: active, maxAlarms: 5000 }
     body: { nePks: "{appliance_ids}" }

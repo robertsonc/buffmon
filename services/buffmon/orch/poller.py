@@ -13,7 +13,14 @@ Connection settings come from the environment (or flags), never from the mapping
     BUFFMON_ORCH_TOKEN          the API token itself (prefer the file)
     BUFFMON_ORCH_USERNAME / BUFFMON_ORCH_PASSWORD_FILE             (auth.mode: login)
     BUFFMON_ORCH_CA_BUNDLE      PEM bundle for a private CA (TLS verification stays on)
+    BUFFMON_ORCH_POST_POLICY    deploy/orchestrator/post-allowlist.yaml (reads offered only as POST)
+    BUFFMON_ORCH_DENY_POSTS=1   send no POST at all; POST collectors are switched off
     BUFFMON_CLICKHOUSE_URL / _USER / _PASSWORD / _DATABASE         (writes)
+
+A mapping with an enabled POST collector needs the POST policy (or
+--deny-posts): the poller will not start otherwise. At start-up it logs the
+policy's sha256 and every rule it will use, and passes the client only those
+rules.
 """
 
 from __future__ import annotations
@@ -44,12 +51,14 @@ from .mapping import (
     CollectorName,
     MappingFile,
     bucket_context,
+    check_against_policy,
     load_mapping,
     normalize,
     render_body,
     render_params,
     render_path,
 )
+from .post_policy import EMPTY_POLICY, PostPolicy, PostPolicyError, load_policy
 
 log = logging.getLogger(__name__)
 
@@ -128,8 +137,8 @@ class Poller:
             if col.method == "POST":
                 ids = [str(r["appliance_id"]) for r in self.inventory]
                 responses = [
-                    await self.client.post_read_json(
-                        path, params, render_body(col.body, ids[i:i + col.body_chunk])
+                    await self.client.post_json(
+                        col.post_rule or "", params, render_body(col.body, ids[i:i + col.body_chunk])
                     )
                     for i in range(0, max(len(ids), 1), col.body_chunk)
                 ]
@@ -218,6 +227,43 @@ def build_auth(mapping: MappingFile, args: argparse.Namespace) -> AuthConfig:
     raise OrchError("the mapping has no usable auth section (auth.mode is null)")
 
 
+def resolve_post_policy(
+    mapping: MappingFile, policy_file: Path | None, deny_posts: bool
+) -> tuple[MappingFile, PostPolicy]:
+    """The mapping to run and the (narrowed) POST policy to give the client.
+
+    Fails closed: POST collectors without a policy file are an error, not a
+    silent downgrade. ``deny_posts`` is the explicit downgrade: POST collectors
+    are switched off and the client gets no rules."""
+    posts = {n: c for n, c in mapping.enabled().items() if c.method == "POST"}
+    if deny_posts:
+        if posts:
+            log.warning("POSTs denied (--deny-posts): collectors %s are switched off", ", ".join(sorted(posts)))
+            collectors = {n: c.model_copy(update={"enabled": False}) if n in posts else c
+                          for n, c in mapping.collectors.items()}
+            mapping = mapping.model_copy(update={"collectors": collectors})
+        return mapping, EMPTY_POLICY
+    if not posts:
+        if policy_file is not None:
+            log.info("POST policy %s not used: no enabled collector sends POST", policy_file)
+        return mapping, EMPTY_POLICY
+    if policy_file is None:
+        raise PostPolicyError(
+            f"collectors {', '.join(sorted(posts))} send POST, which needs the POST policy: set --post-policy "
+            f"(BUFFMON_ORCH_POST_POLICY) to deploy/orchestrator/post-allowlist.yaml, or run with --deny-posts"
+        )
+    policy = load_policy(policy_file)
+    problems = check_against_policy(mapping, policy)
+    if problems:
+        raise PostPolicyError("the mapping does not fit the POST policy:\n  " + "\n  ".join(problems))
+    used = policy.only({c.post_rule for c in posts.values() if c.post_rule})
+    log.info("POST policy %s sha256=%s: %d rule(s), %d used by this mapping",
+             policy_file, policy.sha256, len(policy.rules), len(used.rules))
+    for line in used.describe():
+        log.info("POST allowed: %s", line)
+    return mapping, used
+
+
 def _env_path(name: str) -> Path | None:
     # Not `Path(x or "") or None`: Path("") is Path(".") and is truthy.
     value = os.environ.get(name, "").strip()
@@ -233,6 +279,11 @@ def main(argv: list[str] | None = None, *, transport: httpx.AsyncBaseTransport |
     ap.add_argument("--token-env", default="BUFFMON_ORCH_TOKEN", help="env var holding the token")
     ap.add_argument("--password-file", type=Path, default=_env_path("BUFFMON_ORCH_PASSWORD_FILE"))
     ap.add_argument("--ca-bundle", type=Path, default=_env_path("BUFFMON_ORCH_CA_BUNDLE"))
+    ap.add_argument("--post-policy", type=Path, default=_env_path("BUFFMON_ORCH_POST_POLICY"),
+                    help="POST allowlist (BUFFMON_ORCH_POST_POLICY); needed by POST collectors")
+    ap.add_argument("--deny-posts", action="store_true",
+                    default=env("BUFFMON_ORCH_DENY_POSTS", "").strip().lower() in ("1", "true", "yes"),
+                    help="send no POST at all; POST collectors are switched off (BUFFMON_ORCH_DENY_POSTS=1)")
     ap.add_argument("--timeout", type=float, default=15.0)
     ap.add_argument("--once", action="store_true", help="poll every enabled collector once and exit")
     ap.add_argument("--dry-run", action="store_true", help="print normalized rows; write nothing")
@@ -244,7 +295,8 @@ def main(argv: list[str] | None = None, *, transport: httpx.AsyncBaseTransport |
 
     try:
         mapping = load_mapping(args.mapping)
-    except ValueError as exc:
+        mapping, post_policy = resolve_post_policy(mapping, args.post_policy, args.deny_posts)
+    except ValueError as exc:  # includes PostPolicyError
         print(f"error: {exc}", file=sys.stderr)
         return 2
     if not mapping.enabled():
@@ -256,7 +308,7 @@ def main(argv: list[str] | None = None, *, transport: httpx.AsyncBaseTransport |
         return 2
     try:
         cfg = ClientConfig(base_url=args.url, auth=build_auth(mapping, args), timeout_s=args.timeout,
-                           ca_bundle=args.ca_bundle)
+                           ca_bundle=args.ca_bundle, post_policy=post_policy)
         client = OrchClient(cfg, transport=transport)
     except OrchError as exc:
         print(f"error: {exc}", file=sys.stderr)

@@ -39,6 +39,7 @@ buffmon-simulate = "buffmon.tools.simulate:main"
 buffmon-flows = "buffmon.flows.consumer:main"
 buffmon-orch-discover = "buffmon.orch.swagger:main"
 buffmon-orch-poll = "buffmon.orch.poller:main"
+buffmon-orch-policy = "buffmon.orch.policy_cli:main"
 
 [tool.setuptools.packages.find]
 include = ["buffmon*"]

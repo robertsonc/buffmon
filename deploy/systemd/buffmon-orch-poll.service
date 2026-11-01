@@ -1,5 +1,5 @@
 [Unit]
-Description=buffmon Orchestrator poller (read-only GETs -> ClickHouse tunnel_stats / alarms)
+Description=buffmon Orchestrator poller (read-only -> ClickHouse tunnel_stats / alarms)
 Documentation=https://github.com/robertsonc/buffmon/blob/main/deploy/orchestrator/README.md
 After=network-online.target
 Wants=network-online.target
@@ -16,11 +16,17 @@ RestartSec=30s
 # e.g. https://orchestrator.example/gms/rest
 Environment=BUFFMON_ORCH_URL=https://orchestrator.example/gms/rest
 # Use an Orchestrator API key with a READ-ONLY role. The client only sends GET
-# plus one approved read-only POST (/alarm/appliance), but least privilege
-# should not rely on the client alone: the
-# tunnel configuration endpoints return IPsec fields to any key that can read them.
+# plus the reads allowed by the POST policy below, but least privilege should
+# not rely on the client alone: the tunnel configuration endpoints return IPsec
+# fields to any key that can read them.
 LoadCredential=orch-token:/etc/buffmon/orch-token
 Environment=BUFFMON_ORCH_TOKEN_FILE=%d/orch-token
+# POST allowlist (deploy/orchestrator/post-allowlist.yaml): root-owned, 0644.
+# The poller refuses to start without it if the mapping has a POST collector,
+# and refuses it if group or others can write it.
+Environment=BUFFMON_ORCH_POST_POLICY=/etc/buffmon/orchestrator/post-allowlist.yaml
+# Kill switch: uncomment to send no POST at all (POST collectors switched off).
+#Environment=BUFFMON_ORCH_DENY_POSTS=1
 Environment=BUFFMON_CLICKHOUSE_URL=http://127.0.0.1:8123
 Environment=BUFFMON_CLICKHOUSE_USER=buffmon
 # BUFFMON_CLICKHOUSE_PASSWORD: root-owned 0600 file, read by systemd before

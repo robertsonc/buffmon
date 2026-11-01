@@ -12,12 +12,15 @@ Two documented exceptions:
 
 * the login request declared in the mapping file (``auth.mode: login``), sent at
   most once per login, never retried, only while :meth:`OrchClient.login` runs;
-* :data:`READ_ONLY_POSTS`: endpoints that only *read* but which Orchestrator
-  exposes as POST. Each one is listed here by name, in code, after explicit
-  approval from the deployment owner, so a mapping edit can never add one.
+* POSTs allowed by the POST policy (:mod:`buffmon.orch.post_policy`, file
+  ``deploy/orchestrator/post-allowlist.yaml``): reads that Orchestrator only
+  offers as POST. Each request goes through :meth:`OrchClient.post_json` with a
+  rule id; the rule supplies the path and limits every parameter and body key,
+  and the request hook re-checks that the outgoing POST carries that rule's id
+  and exact path. No policy, no POSTs.
 
-Apart from that list, no endpoint, header name or field name is built in: they
-come from the mapping file and the deployment's settings.
+No endpoint, header name or field name is built in: they come from the mapping
+file, the POST policy and the deployment's settings.
 """
 
 from __future__ import annotations
@@ -37,18 +40,12 @@ from typing import Any, Literal
 import httpx
 from pydantic import SecretStr
 
+from .post_policy import EMPTY_POLICY, PostPolicy
+
 log = logging.getLogger(__name__)
 
-# Read-only operations that Orchestrator only offers as POST. Adding an entry is
-# a code change with review, never a mapping edit. Paths are relative to the
-# API base (e.g. /gms/rest).
-READ_ONLY_POSTS: frozenset[str] = frozenset({
-    # "Retrieve appliance alarms for specified appliances" (Orchestrator 10.x:
-    # body {"nePks": [...]}, returns the alarm list). The GET alternative,
-    # /alarm/correlatedAlarms, only returns the correlated root-cause view.
-    # Approved by the deployment owner on 2026-11-01.
-    "/alarm/appliance",
-})
+# Request extension that tells the request hook which POST-policy rule a POST was sent under.
+POST_RULE_EXTENSION = "buffmon_post_rule"
 
 TRANSIENT_STATUS = frozenset({429, 500, 502, 503, 504})
 ParamValue = str | int | float | bool
@@ -123,6 +120,8 @@ class ClientConfig:
     backoff_base_s: float = 0.5
     backoff_max_s: float = 30.0
     max_response_bytes: int = 64 * 1024 * 1024
+    # Which POSTs may be sent at all (fails closed: empty policy, no POSTs).
+    post_policy: PostPolicy = EMPTY_POLICY
 
 
 def load_secret(file: Path | None, env_name: str | None, what: str) -> SecretStr | None:
@@ -193,9 +192,9 @@ class OrchClient:
             follow_redirects=False,
             event_hooks={"request": [self._guard]},
         )
-        # Exact URL paths (API base + allow-listed path) the request hook lets POST through.
+        # rule id -> exact URL path (API base + rule path) the request hook accepts for it.
         base_path = httpx.URL(cfg.base_url).path.rstrip("/")
-        self._read_only_post_paths = frozenset(base_path + p for p in READ_ONLY_POSTS)
+        self._post_paths = {r.id: base_path + r.path for r in cfg.post_policy.rules}
         self._sem = asyncio.Semaphore(cfg.max_concurrency)
         self._slot_lock = asyncio.Lock()
         self._next_slot = 0.0
@@ -224,8 +223,11 @@ class OrchClient:
         """Last line of defence: runs for every request the httpx client sends."""
         if request.method == "GET":
             return
-        if request.method == "POST" and request.url.path in self._read_only_post_paths:
-            return
+        if request.method == "POST" and POST_RULE_EXTENSION in request.extensions:
+            why = self._post_refusal(request)
+            if why is None:
+                return
+            raise ReadOnlyViolationError(f"refused to send POST {request.url.path}: {why}")
         login = self.cfg.auth.login
         if (
             self._login_in_progress
@@ -237,6 +239,31 @@ class OrchClient:
         raise ReadOnlyViolationError(
             f"refused to send {request.method} {request.url.path}: the Orchestrator client is read-only"
         )
+
+    def _post_refusal(self, request: httpx.Request) -> str | None:
+        """Why the outgoing POST does not fit the POST-policy rule it claims (None: it fits).
+        Checks what is actually on the wire: path, query string and body bytes."""
+        rule_id = request.extensions.get(POST_RULE_EXTENSION)
+        rule = self.cfg.post_policy.rule(rule_id) if isinstance(rule_id, str) else None
+        if rule is None:
+            return f"rule {rule_id!r} is not in the POST policy"
+        if request.url.path != self._post_paths[rule.id]:
+            return f"rule {rule.id} allows only {self._post_paths[rule.id]}"
+        items = request.url.params.multi_items()
+        if len({k for k, _ in items}) != len(items):
+            return "repeated query parameters"
+        try:
+            content = request.content
+        except httpx.RequestNotRead:
+            return "streamed body (a rule's body must be checked before sending)"
+        if len(content) > rule.max_body_bytes:
+            return f"body is {len(content)} bytes (rule {rule.id} allows {rule.max_body_bytes})"
+        try:
+            body = json.loads(content) if content else None
+        except ValueError:
+            return "body is not JSON"
+        problems = rule.check_request(dict(items), body)
+        return "; ".join(problems) if problems else None
 
     # -- auth -----------------------------------------------------------------
     def _auth_headers(self) -> dict[str, str]:
@@ -323,21 +350,31 @@ class OrchClient:
         """GET ``path`` and return the decoded JSON, retrying transient failures."""
         return await self._send("GET", path, params, None)
 
-    async def post_read_json(
-        self, path: str, params: Mapping[str, ParamValue] | None, body: Any
-    ) -> Any:
-        """POST to one of :data:`READ_ONLY_POSTS` (reads that Orchestrator exposes
-        as POST). Any other path raises before a byte is sent. Retried like a
-        GET: the operation only reads, so repeating it is safe."""
-        if path not in READ_ONLY_POSTS:
+    async def post_json(self, rule_id: str, params: Mapping[str, ParamValue] | None, body: Any) -> Any:
+        """POST under a POST-policy rule: the rule supplies the path, and every
+        query parameter and body key must fit it. Refused before sending
+        otherwise. Retried like a GET (policy rules only read)."""
+        rule = self.cfg.post_policy.rule(rule_id)
+        if rule is None:
             raise ReadOnlyViolationError(
-                f"refused to send POST {path}: not one of the approved read-only POSTs "
-                f"({', '.join(sorted(READ_ONLY_POSTS))})"
+                f"refused to send POST: rule {rule_id!r} is not in the POST policy "
+                f"(policy has: {', '.join(r.id for r in self.cfg.post_policy.rules) or 'no rules'})"
             )
-        return await self._send("POST", path, params, body)
+        problems = rule.check_request(params or {}, body)
+        size = len(json.dumps(body, separators=(",", ":")).encode("utf-8"))
+        if size > rule.max_body_bytes:
+            problems.append(f"body is {size} bytes (rule {rule.id} allows {rule.max_body_bytes})")
+        if problems:
+            raise ReadOnlyViolationError(f"refused to send POST {rule.path}: " + "; ".join(problems))
+        return await self._send("POST", rule.path, params, body, rule.id)
 
     async def _send(
-        self, method: str, path: str, params: Mapping[str, ParamValue] | None, json_body: Any
+        self,
+        method: str,
+        path: str,
+        params: Mapping[str, ParamValue] | None,
+        json_body: Any,
+        post_rule: str | None = None,
     ) -> Any:
         if self.cfg.auth.mode == "login" and not self._logged_in:
             await self.login()
@@ -357,7 +394,10 @@ class OrchClient:
                         if method == "GET":
                             resp = await self._client.get(path, params=q, headers=self._auth_headers())
                         else:
-                            resp = await self._client.post(path, params=q, json=json_body, headers=self._auth_headers())
+                            resp = await self._client.post(
+                                path, params=q, json=json_body, headers=self._auth_headers(),
+                                extensions={POST_RULE_EXTENSION: post_rule},
+                            )
                         body = resp.content
                 except TimeoutError:
                     last = OrchTimeoutError(f"{what}: no complete response within {self.cfg.timeout_s:g} s")
