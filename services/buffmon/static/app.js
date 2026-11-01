@@ -21,12 +21,16 @@
   var LIVE_MS = 15 * 60 * 1000;
 
   var S = {
-    sessions: {}, list: [], series: {}, thresholds: null, retentionMs: 900000,
+    sessions: {}, list: [], series: {}, thresholds: null, retentionMs: 900000, paths: {}, pathsUnavailable: null, tunnels: [],
     filterStatus: null, search: "", cls: "", kind: "", lastMsgAt: 0, retry: 0,
     open: null, histRange: "1h", histTimer: null, cards: {}, siteEls: {}, ever: false,
   };
 
   // ---------------------------------------------------------------- helpers
+  var PATH_LABEL = {
+    forward_dscp_mismatch: "DSCP re-marked → (probe may be on the wrong overlay)",
+    return_dscp_mismatch: "DSCP re-marked on the return path"
+  };
   function $(id) { return document.getElementById(id); }
   function el(tag, cls, text) {
     var e = document.createElement(tag);
@@ -48,6 +52,8 @@
     return Math.round(sec / 3600) + " h ago";
   }
   function classTh(s) {
+    // The server resolves class + per-target override; prefer that.
+    if (s.thresholds) return s.thresholds;
     var t = S.thresholds;
     if (!t) return null;
     return t.classes[s.effective_class] || t.classes[t.default_class] || null;
@@ -268,13 +274,14 @@
     var foot = el("div", "card-foot");
     var footText = el("span");
     var pathchg = el("span", "pathchg");
+    var pathinfo = el("span", "pathinfo");
     var reason = el("span", "reason");
-    foot.appendChild(footText); foot.appendChild(pathchg); foot.appendChild(reason);
+    foot.appendChild(footText); foot.appendChild(pathchg); foot.appendChild(pathinfo); foot.appendChild(reason);
     c.appendChild(head); c.appendChild(metrics); c.appendChild(canvas); c.appendChild(foot);
     c.addEventListener("click", function () { openDrawer(c.dataset.key); });
     c.addEventListener("keydown", function (e) { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); openDrawer(c.dataset.key); } });
     return { root: c, title: t, meta: meta, badge: badge, pill: pill, metrics: mEls, canvas: canvas,
-      footText: footText, pathchg: pathchg, reason: reason };
+      footText: footText, pathchg: pathchg, pathinfo: pathinfo, reason: reason };
   }
 
   function updateCard(card, s, xMax) {
@@ -305,6 +312,17 @@
         pc.hops_from + "→" + pc.hops_to + " hops, " + ago((xMax - pc.ts_ms) / 1000);
     } else {
       card.pathchg.textContent = "";
+    }
+    var path = s.kind === "stamp" ? S.paths[s.key] : null;
+    if (path) {
+      card.pathinfo.className = "pathinfo" + (path.status === "warn" ? " warn" : "");
+      var warnF = path.findings.filter(function (f) { return f.severity === "warn"; })[0];
+      card.pathinfo.textContent = warnF ? (PATH_LABEL[warnF.code] || "Path warning")
+        : path.summary ? "via " + path.summary : "not in flow export";
+      card.pathinfo.title = path.findings.map(function (f) { return f.text; }).join("\n");
+    } else {
+      card.pathinfo.textContent = "";
+      card.pathinfo.removeAttribute("title");
     }
     card.reason.textContent = s.reasons && s.reasons.length ? s.reasons[0] : "";
     card.reason.title = s.reasons ? s.reasons.join("\n") : "";
@@ -391,9 +409,57 @@
     tbl.appendChild(tr);
   }
 
+  function hopText(h, dir) {
+    var out = h.out_if_name || ("ifIndex " + h.out_if), inn = h.in_if_name || ("ifIndex " + h.in_if);
+    return h.appliance + ": in " + inn + (h.in_transport ? " (" + h.in_transport + ")" : "") +
+      " → out " + out + (h.out_transport ? " (" + h.out_transport + ")" : "") +
+      " · " + dscpName(h.dscp) + " · " + h.packets + " pkts · last " +
+      ago(Math.max(0, (Date.now() - h.last_ms) / 1000));
+  }
+  function renderPath(s) {
+    var box = $("d-path");
+    box.textContent = "";
+    if (s.kind !== "stamp") { box.appendChild(el("p", "muted", "Path validation applies to STAMP sessions.")); return; }
+    if (S.pathsUnavailable) { box.appendChild(el("p", "muted", S.pathsUnavailable)); return; }
+    var p = S.paths[s.key];
+    if (!p) { box.appendChild(el("p", "muted", "Waiting for flow data…")); return; }
+    [["Forward (probe → reflector)", p.forward], ["Return (reflector → probe)", p["return"]]].forEach(function (d) {
+      box.appendChild(el("div", "path-dir", d[0]));
+      var ul = el("ul", "path-hops");
+      if (!d[1].length) ul.appendChild(el("li", "muted", "not seen in the flow export"));
+      d[1].forEach(function (h) { ul.appendChild(el("li", h.dscp !== s.dscp ? "warn" : null, hopText(h))); });
+      box.appendChild(ul);
+    });
+    if (p.findings.length) {
+      var fl = el("ul", "reasons");
+      p.findings.forEach(function (f) { fl.appendChild(el("li", f.severity === "warn" ? "warn" : null, f.text)); });
+      box.appendChild(fl);
+    }
+  }
+
+  function renderPathTunnels(s) {
+    var box = $("d-tunnels");
+    box.textContent = "";
+    var p = s.kind === "stamp" ? S.paths[s.key] : null;
+    var apps = {};
+    if (p) p.forward.concat(p["return"]).forEach(function (h) { apps[h.appliance] = true; });
+    var rows = (S.tunnels || []).filter(function (t) { return apps[t.appliance]; });
+    if (!rows.length) {
+      box.appendChild(el("p", "muted", p && Object.keys(apps).length
+        ? "No Orchestrator tunnel data for " + Object.keys(apps).join(", ") + " (is buffmon-orch-poll running?)."
+        : "Shown once the probe's path through an EdgeConnect is known from the flow export."));
+      return;
+    }
+    box.appendChild(el("p", "muted", "Tunnel loss before FEC is what the underlay did; after FEC is what the " +
+      "overlay delivered. Compare with this probe's own loss above."));
+    box.appendChild(tunnelTable(rows));
+  }
+
   function refreshDrawer(first) {
     var s = S.sessions[S.open];
     if (!s) return;
+    renderPath(s);
+    renderPathTunnels(s);
     $("d-title").textContent = s.session;
     $("d-sub").textContent = s.site + " · " + (KIND_LABEL[s.kind] || s.kind) + " · " + s.app_class + " · " + dscpName(s.dscp);
     var pill = $("d-pill");
@@ -403,6 +469,12 @@
     ul.textContent = "";
     (s.reasons.length ? s.reasons : ["All evaluated metrics are within target for " + s.effective_class + "."])
       .forEach(function (r) { ul.appendChild(el("li", null, r)); });
+    // A probe on the wrong path measures a path nobody uses: say so next to the verdict.
+    var pth = s.kind === "stamp" ? S.paths[s.key] : null;
+    if (pth && pth.status === "warn") {
+      ul.appendChild(el("li", "warn", "These results may not represent " + s.app_class +
+        " traffic: see Path below."));
+    }
 
     var xMax = latestTs();
     var th = classTh(s);
@@ -441,7 +513,8 @@
     dl.textContent = "";
     var meta = [
       ["Probe", s.probe_id], ["Source", s.src], ["Target", target(s)],
-      ["DSCP", dscpName(s.dscp)], ["Thresholds", s.effective_class + (s.effective_class !== s.app_class ? " (default)" : "")],
+      ["DSCP", dscpName(s.dscp)], ["Thresholds", s.effective_class + (s.effective_class !== s.app_class ? " (default)" : "") +
+        (s.threshold_override ? " · override " + s.threshold_override : "")],
       ["TTL → / ←", (s.ttl_fwd == null ? "–" : s.ttl_fwd) + " / " + (s.ttl_back == null ? "–" : s.ttl_back)],
       ["Receive timestamps", s.rx_ts === "kernel" ? "kernel" : "user space (less precise)"],
       ["Clock sync", s.clock_synced ? "synchronised" + (s.clock_err_us != null ? " (±" + s.clock_err_us + " µs)" : "")
@@ -457,6 +530,83 @@
       b.setAttribute("aria-selected", String(b.dataset.range === S.histRange));
     });
   }
+
+  // EdgeConnect tunnel health from Orchestrator (buffmon-orch-poll), polled.
+  function fmtNum(v, digits) { return v == null ? "–" : (Math.round(v * Math.pow(10, digits)) / Math.pow(10, digits)).toString(); }
+  function lossCell(pkts, pctMax) {
+    if (pkts == null) return "–";
+    return pkts + " pkts" + (pkts && pctMax != null ? " (max " + fmtNum(pctMax, 2) + "%/min)" : "");
+  }
+  function tunnelTable(rows) {
+    var tbl = el("table", "win ec-table");
+    var head = el("tr");
+    ["Tunnel", "Type", "Latency avg / max", "Jitter", "Loss before FEC", "Loss after FEC", "MOS min"].forEach(function (h) {
+      head.appendChild(el("th", null, h));
+    });
+    var thead = el("thead"); thead.appendChild(head); tbl.appendChild(thead);
+    rows.forEach(function (t) {
+      var tr = el("tr", (t.loss_post_pkts || 0) > 0 ? "warn" : null);
+      tr.title = t.tunnel_name + " (" + t.tunnel_id + ")";
+      tr.appendChild(el("td", null, "→ " + (t.peer || t.tunnel_id)));
+      tr.appendChild(el("td", null, t.tunnel_kind === "overlay" ? "overlay " + (t.overlay || "") :
+        t.tunnel_kind === "underlay" ? "underlay " + (t.transport || "") : (t.tunnel_kind || "")));
+      tr.appendChild(el("td", null, fmtNum(t.latency_ms, 1) + " / " + fmtNum(t.latency_max_ms, 0) + " ms"));
+      tr.appendChild(el("td", null, fmtNum(t.jitter_ms, 1) + " ms"));
+      tr.appendChild(el("td", null, lossCell(t.loss_pre_pkts, t.loss_pre_pct_max)));
+      tr.appendChild(el("td", null, lossCell(t.loss_post_pkts, t.loss_post_pct_max)));
+      tr.appendChild(el("td", null, fmtNum(t.mos_min, 2)));
+      tbl.appendChild(tr);
+    });
+    return tbl;
+  }
+  function renderTunnels() {
+    var box = $("ec-body");
+    var rows = S.tunnels || [];
+    $("ec").hidden = rows.length === 0;
+    if (!rows.length) return;
+    box.textContent = "";
+    var byApp = {};
+    rows.forEach(function (t) { (byApp[t.appliance] = byApp[t.appliance] || []).push(t); });
+    var apps = Object.keys(byApp).sort();
+    var pre = 0, post = 0;
+    rows.forEach(function (t) { pre += t.loss_pre_pkts || 0; post += t.loss_post_pkts || 0; });
+    $("ec-counts").textContent = apps.length + " appliances · " + rows.length + " tunnels · loss " + pre +
+      " pkts before FEC, " + post + " after";
+    apps.forEach(function (a) {
+      var list = byApp[a];
+      var head = el("div", "ec-app");
+      head.appendChild(el("b", null, a));
+      head.appendChild(el("span", "muted", " · " + (list[0].site || "no site") + " · " + list.length + " tunnels"));
+      var rec = list.reduce(function (n, t) { return n + (t.fec_recovered_pkts || 0); }, 0);
+      if (rec) head.appendChild(el("span", "ec-fec", " · FEC recovered " + rec + " pkts"));
+      box.appendChild(head);
+      box.appendChild(tunnelTable(list));
+    });
+  }
+  function loadTunnels() {
+    fetch("/v1/tunnels?minutes=15", { credentials: "same-origin", headers: { accept: "application/json" } })
+      .then(function (r) {
+        if (r.status === 401) { location.href = "/login"; throw new Error("login required"); }
+        return r.json().then(function (b) { if (!r.ok) throw new Error(b.error || ("HTTP " + r.status)); return b; });
+      })
+      .then(function (b) { S.tunnels = b.tunnels || []; renderTunnels(); if (S.open) refreshDrawer(false); })
+      .catch(function () { S.tunnels = []; renderTunnels(); });
+  }
+  setInterval(loadTunnels, 60000);
+  setTimeout(loadTunnels, 1500);
+
+  // Probe paths from the EdgeConnect flow export: near-real-time, so poll, not push.
+  function loadPaths() {
+    fetch("/v1/paths?minutes=5", { credentials: "same-origin", headers: { accept: "application/json" } })
+      .then(function (r) {
+        if (r.status === 401) { location.href = "/login"; throw new Error("login required"); }
+        return r.json().then(function (b) { if (!r.ok) throw new Error(b.error || ("HTTP " + r.status)); return b; });
+      })
+      .then(function (b) { S.paths = b.paths || {}; S.pathsUnavailable = null; render(); if (S.open) refreshDrawer(false); })
+      .catch(function (e) { S.pathsUnavailable = "Path data unavailable: " + e.message; });
+  }
+  setInterval(loadPaths, 30000);
+  setTimeout(loadPaths, 2000);
 
   function loadHistory() {
     var s = S.sessions[S.open];

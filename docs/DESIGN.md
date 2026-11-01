@@ -196,25 +196,46 @@ Per session, over rolling windows:
   an identity-aware proxy in front for production.
 - Every external integration is read-only. Probe traffic on a non-lab network
   needs an explicit go-ahead: packet trains (P3) are bursty by design.
+- Orchestrator: GET only, except reads that exist only as POST. Each of those is
+  a rule in `deploy/orchestrator/post-allowlist.yaml` (`effect: read` only;
+  exact path; typed limits on every parameter and body key; approver and the
+  releases it was verified on), enforced before sending and again on the wire.
+  No policy, no POST; `--deny-posts` is the kill switch.
 
 ## 10. Phases
 
 | Phase | Scope | Done when |
 |---|---|---|
 | **P1 (this PR)** | STAMP sender + stateful reflector, ICMP, TCP; ingest with auth and dedup; ClickHouse; live dashboard; systemd units | In the lab, loss/latency/jitter per site and target reach the dashboard within 5 s; an injected 2% loss (`tc netem`) shows within 30 s, attributed to the right direction |
-| P2 | EdgeConnect: IPFIX via goflow2 → Redpanda → ClickHouse; Orchestrator poller for tunnel/overlay stats and alarms, 9.7.2 and 10.x; probe path validation; underlay vs delivered loss | Each probe session shows the overlay and transport it actually used; pre-FEC vs post-FEC loss next to probe loss |
+| P2 | EdgeConnect: IPFIX via goflow2 → ClickHouse; Orchestrator poller for tunnel/overlay stats and alarms, 9.7.2 and 10.x; probe path validation; underlay vs delivered loss | Each probe session shows the appliance and interfaces it actually used; pre-FEC vs post-FEC loss next to probe loss |
 | P3 | Path characterisation: Paris-style traceroute with change detection; packet-train capacity estimate | Path changes flagged within one cycle; capacity estimate within ±20% of a known shaped rate on wired lab links |
 | P4 | Identity graph: ClearPass, DHCP, Central/Mist; enrichment on arrival | Any IP at any time resolves to MAC, device and user where the sources know them |
 | P5 | UXI and HPE SSE ingestion; segment view; UXI as control group | One screen shows, per site, which segment is degraded and the evidence for it |
 | P6 | Passive TCP: SPAN sensor where traffic is not proxied or tunnelled; good/bad session % over time; reports | Hourly good-session % per site and app, with the observation point recorded |
 
+### Phase 2 status
+
+- Done: per-target threshold overrides; flow pipeline (standard IPFIX
+  elements) with exporter allowlist and probe path validation; Orchestrator
+  10.x tunnel stats and alarms, verified against a live 10.0.0.40724
+  Orchestrator (`deploy/orchestrator/README.md`); tunnel health on the
+  dashboard and next to each probe's path; the POST allowlist and its review
+  tool (`buffmon-orch-policy`).
+- Deviation: no Redpanda yet. One collector process writes straight to
+  ClickHouse with the same batching and dedup guarantees as ingest; the bus
+  comes in when there is more than one collector or the flow rate needs it.
+- Open: EdgeConnect enterprise IPFIX elements (overlay/tunnel per flow), which
+  would tie a probe to its overlay directly instead of via its appliance; the
+  9.7.2 mapping; Orchestrator's loss-percentage scale under real loss.
+
 ## 11. What has to be confirmed in the lab before P2+
 
 Not guessed here; each changes a design detail.
 
-- Orchestrator 9.7.2 and 10.x: the REST endpoints for tunnel/overlay statistics,
-  their granularity, and whether loss before and after FEC (and reorder before
-  and after POC) is exposed. A Swagger export from each version is enough.
+- ~~Orchestrator 10.x: tunnel/overlay statistics endpoints, granularity, loss
+  before/after FEC.~~ Confirmed on 10.0.0.40724: per-minute, per tunnel, loss
+  and reorder before/after correction, latency, jitter, MOS. Still needed: a
+  9.7.2 export (if any Orchestrator still runs 9.7.2).
 - EdgeConnect IPFIX: template fields on your ECOS releases (overlay/tunnel ID,
   application, segment/VRF). A short pcap of the export is enough.
 - Which sites run TCP acceleration (affects passive TCP placement).

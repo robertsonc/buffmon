@@ -1,0 +1,51 @@
+# buffmon -> Orchestrator POST allowlist.
+#
+# The Orchestrator client sends GET only. A POST is sent only when a mapping
+# collector names a rule below (post_rule: <id>) AND the request fits the rule:
+# exact path, only the listed query parameters and body keys, within their
+# limits. The client checks this before sending and again on the wire in the
+# httpx request hook. Without this file no POST is sent at all.
+#
+# Rules may only describe READS that Orchestrator happens to expose as POST
+# (`effect: read` is the only value the loader accepts). Anything that changes
+# state (acknowledge, clear, configure, run a test on an appliance, ...) does not
+# belong here or anywhere in the monitoring path.
+#
+# Change this file through a reviewed PR. To add a rule:
+#   buffmon-orch-policy draft --spec <orch export> --path <path> > rule.yaml
+#   (complete it as the draft's header says, then paste it under `rules:`)
+#   buffmon-orch-policy check --policy post-allowlist.yaml --spec <export> --mapping mapping.10.x.yaml
+# Full procedure: deploy/orchestrator/README.md, "Allowing a new POST".
+#
+# The poller logs this file's sha256 and each rule it uses at start-up, and
+# refuses the file if group or others can write it.
+
+version: 1
+rules:
+  - id: alarm-appliance-read
+    method: POST
+    path: /alarm/appliance
+    effect: read
+    purpose: >-
+      Active appliance alarms for the alarms table. Orchestrator 10.x only offers
+      per-appliance alarm retrieval as POST with the appliance ids in the body;
+      the GET alternative (/alarm/correlatedAlarms) returns only the correlated
+      root-cause view.
+    spec:
+      operation_id: getApplianceAlarms
+      summary: Retrieve appliance alarms for specified appliances
+    # Called against a lab Orchestrator of this release (it returned alarm lists).
+    # Read-only per the API reference: a retrieval with filters; acknowledging,
+    # clearing and annotating alarms are separate operations.
+    verified_on: ["10.0.0.40724"]
+    approved_by: robertsonc
+    approved_on: 2026-11-01
+    params:
+      view:      { type: string, enum: [active, closed, all] }
+      maxAlarms: { type: int, min: 1, max: 10000 }
+      from:      { type: int, min: 0 }        # epoch ms
+      to:        { type: int, min: 0 }        # epoch ms
+    body:
+      nePks: { type: list_of_string, pattern: '^[0-9]+\.NE$', max_items: 1000, required: true }
+    max_body_bytes: 65536
+    reviewed_terms: []

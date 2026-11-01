@@ -246,6 +246,12 @@ canvas.spark { width: 100%; height: 46px; display: block; }
 .card-foot .reason { color: var(--text); flex-basis: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .card-foot .reason:empty { display: none; }
 .pathchg { color: var(--degraded); font-weight: 600; }
+.pathinfo { color: var(--muted); }
+.pathinfo.warn { color: var(--degraded); font-weight: 600; }
+.path-dir { font-size: 12px; color: var(--muted); margin-top: 6px; }
+.path-hops { margin: 2px 0 6px; padding-left: 18px; font-size: 13px; font-variant-numeric: tabular-nums; }
+.path-hops li, .reasons li { overflow-wrap: anywhere; }
+.path-hops li.warn, .reasons li.warn { color: var(--degraded); }
 
 .empty {
   margin: 80px auto; max-width: 560px; text-align: center; color: var(--muted);
@@ -314,3 +320,15 @@ canvas.chart { width: 100%; height: 230px; display: block; }
   .metric .sub { white-space: normal; }
   .brand .sub, .site-head .probe { display: none; }
 }
+
+/* ---------- EdgeConnect tunnels ---------- */
+.ec { margin-top: 30px; }
+.ec-app { margin: 14px 0 4px; font-size: 13px; }
+.ec-fec { color: var(--good); font-weight: 600; }
+.ec-table { margin-bottom: 4px; }
+.ec-table td:first-child { color: var(--text); }
+.ec-table tr.warn td { color: var(--degraded); }
+@media (max-width: 720px) {
+  .ec-table { display: block; overflow-x: auto; white-space: nowrap; }
+}
+.ec-table th:nth-child(2), .ec-table td:nth-child(2) { text-align: left; }

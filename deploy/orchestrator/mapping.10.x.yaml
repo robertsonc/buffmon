@@ -1,0 +1,134 @@
+# buffmon <-> Orchestrator 10.x mapping.
+#
+# Filled 2026-11-01 from the Orchestrator 10.0.0.40724 OpenAPI export
+# ("Orchestrator REST APIs" 7.2.0) AND checked with read-only GET calls against
+# a lab Orchestrator 10.0.0.40724 managing EdgeConnect 9.7.2 appliances.
+# Where the live API disagreed with the export, the live behaviour wins; those
+# places are marked LIVE below.
+#
+# Re-check after any Orchestrator upgrade:
+#   buffmon-orch-discover <old export> --diff <new export>
+#   buffmon-orch-poll --mapping mapping.10.x.yaml --once --dry-run
+#
+# The client is read-only: every request below is a GET, except `alarms`, a
+# read that Orchestrator only offers as POST, sent under rule alarm-appliance-read
+# of post-allowlist.yaml (run the poller with --post-policy pointing at it).
+
+version: 1
+orchestrator_version: "10.0"
+source: "OpenAPI export of Orchestrator 10.0.0.40724 + live read-only verification, 2026-11-01"
+
+auth:
+  # The export declares no securityScheme; its curl samples use X-AUTH-TOKEN.
+  # LIVE: an API key in X-Auth-Token returns 200 (/gms/versions).
+  mode: header
+  header_name: X-Auth-Token
+  login: null
+
+collectors:
+  # GET /appliance: list of appliances (LIVE: a JSON list).
+  appliances:
+    enabled: true
+    path: /appliance
+    params: {}
+    interval_s: 600
+    records: ""
+    fields:
+      appliance_id: { from: nePk }        # e.g. "27.NE"
+      hostname:     { from: hostName }
+      site:         { from: site }
+
+  # GET /stats/aggregate/tunnel: one call per appliance returns every tunnel,
+  # overlay (bondedTunnel_*) and underlay (tunnel_*), aggregated over the window.
+  #   LIVE: startTime/endTime are epoch SECONDS (the export says milliseconds;
+  #         millisecond values return an empty object).
+  #   LIVE: with groupByNE=false the response is {tunnelId: record}.
+  #   LIVE: one-minute buckets are populated about 2 minutes after the minute.
+  #   LIVE: `mos` is MOS x 100 (439 = 4.39).
+  #   LIVE: `avg_mos_prefec` returned implausible values on idle tunnels; not used.
+  tunnel_stats:
+    enabled: true
+    path: /stats/aggregate/tunnel
+    params:
+      nePk: "{appliance_id}"
+      granularity: minute
+      groupByNE: false
+      startTime: "{bucket_start_s}"
+      endTime: "{bucket_end_s}"
+    interval_s: 60
+    fan_out: appliances
+    buckets: { size_s: 60, lag_s: 120, count: 3 }   # exact minutes, re-polled to catch late stats
+    records: ""
+    fields:
+      ts:                 { from: $bucket_start }
+      appliance:          { from: $ctx.hostname }
+      tunnel_id:          { from: $key }             # bondedTunnel_17 / tunnel_47
+      tunnel_name:        { from: alias }            # to_<peer>_<overlay> | to_<peer>_<local label>-<remote label>
+      # bondedTunnel_* carry business traffic per overlay; tunnel_* are the
+      # physical underlay tunnels between WAN interfaces.
+      tunnel_kind:        { from: $key, pattern: "^(bondedTunnel|tunnel|passThroughTunnel)_", map: { bondedTunnel: overlay, tunnel: underlay, passThroughTunnel: passthrough } }
+      # overlayid -> name from GET /gms/overlays/config (LIVE: [{name: DEFAULT, id: 4}]).
+      # Physical tunnels report overlayid 0. Add your overlays here.
+      overlay:            { from: overlayid, map: { "0": "", "4": DEFAULT } }
+      # Local WAN interface label from the physical tunnel alias
+      # to_<peer>_<local label>-<remote label>. Hostnames cannot contain "_"
+      # (RFC 1123), labels can (LIVE: "AZR_INET"), so the peer is anchored on
+      # "no underscore" and the label runs to the first "-". Labels containing
+      # "-" would be cut short. Relabel with map, e.g. { INET1: INET }.
+      # Overlay tunnels have no single transport: blanked for tunnel_kind overlay.
+      transport:          { from: alias, pattern: "^to_[^_]+_(.+?)-" }
+      peer:               { from: alias, pattern: "^to_([^_]+)_" }
+      rx_pkts:            { from: SUM_WRX_PKTS }
+      ohead_rx_pkts:      { from: SUM_OHEAD_WRX_PKTS }
+      loss_pre_fec_pkts:  { from: SUM_PRE_LOSS }
+      loss_post_fec_pkts: { from: SUM_POST_LOSS }
+      ooo_pre_poc_pkts:   { from: SUM_PRE_POC }
+      ooo_post_poc_pkts:  { from: SUM_POST_POC }
+      # Documented as percentages; for a single-minute bucket the max is that
+      # minute's value. Not yet observed non-zero on the lab (no loss in 24 h),
+      # so the scale is the export's word, not verified. The *_pkts counts are.
+      loss_pre_fec_pct:   { from: MAX_PRE_PCT_LOSS }
+      loss_post_fec_pct:  { from: MAX_POST_PCT_LOSS }
+      ooo_pre_poc_pct:    { from: MAX_PRE_PCT_POC }
+      ooo_post_poc_pct:   { from: MAX_POST_PCT_POC }
+      # Milliseconds. The export does not say whether this is round-trip or
+      # one-way; the dashboard labels it "tunnel latency (as reported)".
+      latency_ms:         { from: AVG_LATENCY_AVG }
+      jitter_ms:          { from: AVG_JITTER }
+      mos:                { from: mos, scale: 0.01 }
+      bytes_tx:           { from: SUM_WTX_BYTES }
+      bytes_rx:           { from: SUM_WRX_BYTES }
+
+  # POST /alarm/appliance — a READ that Orchestrator only offers as POST, sent
+  # under rule alarm-appliance-read of post-allowlist.yaml. The rule, not this
+  # file, decides what the request may carry (path, parameters, body keys);
+  # anything else is refused before sending.
+  # Body {"nePks": [...]} from the inventory, in chunks of body_chunk.
+  # view=active each minute: the table shows what is active now (an alarm's
+  # latest ingested_at says when it was last seen active). Closure history stays
+  # in Orchestrator.
+  alarms:
+    enabled: true
+    method: POST
+    post_rule: alarm-appliance-read
+    path: /alarm/appliance
+    params: { view: active, maxAlarms: 5000 }
+    body: { nePks: "{appliance_ids}" }
+    body_chunk: 200
+    interval_s: 60
+    fan_out: null
+    records: ""
+    fields:
+      ts:          { from: timeOccurredInMills, convert: epoch_ms }
+      alarm_id:    { from: id }
+      appliance:   { from: hostName }
+      severity:    { from: severity }               # WARNING / MINOR / MAJOR / CRITICAL
+      # LIVE: `type` is the category (SW, TUN, ...); the API's `source` is the
+      # affected object (a prefix, tunnel, BGP peer address), not the subsystem
+      # the export describes; `name` is the alarm name.
+      source:      { from: type }
+      name:        { from: name }                   # e.g. "BGP peer down", passthrough_tunnel_down
+      object:      { from: source }                 # e.g. a BGP peer address, Passthrough_lan1.100
+      description: { from: description }
+      state:       { from: closed, map: { "False": active, "True": closed } }
+      cleared_ts:  { from: clearedTimeInMills, convert: epoch_ms, null_if: [0] }

@@ -16,7 +16,7 @@ import logging
 import random
 import time
 from collections import deque
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
 from typing import Any, Protocol
 
@@ -28,7 +28,10 @@ log = logging.getLogger(__name__)
 
 SECOND_TABLE = "probe_second"
 MINUTE_TABLE = "probe_minute"
-_TABLES = frozenset({SECOND_TABLE})
+FLOWS_TABLE = "flows"
+PROBE_FLOWS_TABLE = "probe_flows"
+# Tables the ingest side may write. Anything else is refused before a request is made.
+_TABLES = frozenset({SECOND_TABLE, FLOWS_TABLE, PROBE_FLOWS_TABLE})
 
 # range key -> (span seconds, bucket seconds, source table)
 HISTORY_RANGES: dict[str, tuple[int, int, str]] = {
@@ -170,8 +173,18 @@ def batch_token(rows: Sequence[Mapping[str, Any]]) -> str:
     return h.hexdigest()
 
 
+def content_token(rows: Sequence[Mapping[str, Any]]) -> str:
+    """Dedup token for rows without a natural key (flow records): a hash of the
+    batch content, so resending the same batch is recognised as a retry."""
+    h = hashlib.sha256()
+    for r in rows:
+        h.update(json.dumps(r, sort_keys=True, separators=(",", ":"), default=str).encode())
+        h.update(b"\x1e")
+    return h.hexdigest()
+
+
 class SampleWriter:
-    """Bounded buffer + background batch inserter for ``probe_second``."""
+    """Bounded buffer + background batch inserter for one table (``probe_second`` by default)."""
 
     def __init__(
         self,
@@ -180,7 +193,13 @@ class SampleWriter:
         flush_interval_s: float = 1.0,
         buffer_max: int = 200_000,
         retry_max_s: float = 30.0,
+        table: str = SECOND_TABLE,
+        token_fn: Callable[[Sequence[Mapping[str, Any]]], str] = batch_token,
     ) -> None:
+        if table not in _TABLES:
+            raise ValueError(f"unknown table {table!r}")
+        self._table = table
+        self._token_fn = token_fn
         self._transport = transport
         self._batch_max = batch_max
         self._flush_interval_s = flush_interval_s
@@ -229,7 +248,8 @@ class SampleWriter:
         }
 
     async def run(self, stop: asyncio.Event) -> None:
-        log.info("insert writer started (batch_max=%d, flush every %.1fs)", self._batch_max, self._flush_interval_s)
+        log.info("insert writer for %s started (batch_max=%d, flush every %.1fs)",
+                 self._table, self._batch_max, self._flush_interval_s)
         while not stop.is_set():
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(self._wake.wait(), timeout=self._flush_interval_s)
@@ -256,13 +276,13 @@ class SampleWriter:
     async def _insert_with_retry(
         self, batch: list[dict[str, Any]], stop: asyncio.Event, max_attempts: int | None = None
     ) -> None:
-        token = batch_token(batch)
+        token = self._token_fn(batch)
         delay = 0.5
         attempt = 0
         while True:
             attempt += 1
             try:
-                await self._transport.insert_rows(SECOND_TABLE, batch, token)
+                await self._transport.insert_rows(self._table, batch, token)
             except ClickHouseError as exc:
                 self.failed_attempts += 1
                 self.last_error = str(exc)

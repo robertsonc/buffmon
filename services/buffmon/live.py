@@ -270,6 +270,11 @@ class LiveHub:
         self._changes: deque[tuple[int, str, int]] = deque(maxlen=CHANGE_LOG_MAX)
         self._snapshot_cache: tuple[int, list[dict[str, Any]]] | None = None
 
+    def set_thresholds(self, thresholds: Thresholds) -> None:
+        """Applies reloaded thresholds; every session is re-graded on the next snapshot."""
+        self.thresholds = thresholds
+        self._snapshot_cache = None
+
     # -- writes ---------------------------------------------------------------
     def ingest(self, rec: ProbeRecord) -> None:
         now = self._clock()
@@ -331,7 +336,8 @@ class LiveHub:
     def summary(self, st: SessionState) -> dict[str, Any]:
         now = self._clock()
         th_cfg = self.thresholds
-        eff_class, th = th_cfg.for_class(st.app_class)
+        resolved = th_cfg.resolve(st.site, st.probe_id, st.session, st.app_class)
+        eff_class, th = resolved.effective_class, resolved.limits
         needed = {*WINDOWS_S, th_cfg.windows.loss_s, th_cfg.windows.latency_s}
         computed = {s: window_stats(st.window(s), st.kind) for s in needed}
         windows = {f"w{s}": computed[s] for s in WINDOWS_S}
@@ -355,6 +361,12 @@ class LiveHub:
             "kind": st.kind,
             "app_class": st.app_class,
             "effective_class": eff_class,
+            "threshold_override": resolved.override,
+            "thresholds": {
+                "rtt_p95_ms": th.rtt_p95_ms.model_dump(),
+                "loss_pct": th.loss_pct.model_dump(),
+                "jitter_ms": th.jitter_ms.model_dump() if th.jitter_ms else None,
+            },
             "dscp": st.dscp,
             "src": st.src,
             "dst": st.dst,

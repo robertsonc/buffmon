@@ -1,0 +1,6 @@
+# Changes here decide what buffmon may send to Orchestrator. GitHub enforces
+# this file only with branch protection "Require review from Code Owners" on
+# main; until then it routes review requests and documents ownership.
+/deploy/orchestrator/post-allowlist.yaml  @robertsonc
+/services/buffmon/orch/post_policy.py     @robertsonc
+/services/buffmon/orch/client.py          @robertsonc

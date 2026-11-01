@@ -1,0 +1,11 @@
+{
+  "_comment": "Shape of POST /alarm/appliance as returned live by Orchestrator 10.0.0.40724 (2026-11-01): field names are real, values are synthetic. Trimmed to the fields the 10.x mapping reads.",
+  "records": [
+    {"id": 101, "applianceId": "1.NE", "hostName": "ec-a-01", "severity": "MAJOR", "type": "SW",
+     "name": "BGP peer down", "source": "192.0.2.10", "description": "A BGP peer session is not in Established state",
+     "closed": false, "timeOccurredInMills": 1793449328000, "clearedTimeInMills": 0},
+    {"id": 102, "applianceId": "2.NE", "hostName": "ec-a-02", "severity": "CRITICAL", "type": "TUN",
+     "name": "passthrough_tunnel_down", "source": "Passthrough_lan1.100", "description": "Passthrough Tunnel peer is unreachable.",
+     "closed": true, "timeOccurredInMills": 1793448664000, "clearedTimeInMills": 1793448904000}
+  ]
+}

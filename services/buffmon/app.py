@@ -24,10 +24,12 @@ from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoin
 from .auth import ProbeTokens, bearer_token
 from .config import Settings
 from .dedup import RecentKeys
+from .flows.path import analyse, query_paths
 from .live import WINDOWS_S, LiveHub
 from .models import NAME_PATTERN, IngestBatch, ProbeRecord
 from .store import HISTORY_RANGES, ClickHouseError, HttpTransport, SampleWriter, Transport, query_history, record_to_row
-from .thresholds import load_thresholds
+from .thresholds import ThresholdsFile
+from .tunnels import query_tunnels
 from .uiauth import COOKIE_NAME, UiAuth
 
 log = logging.getLogger(__name__)
@@ -60,6 +62,7 @@ class AppState:
     settings: Settings
     tokens: ProbeTokens
     dedup: RecentKeys
+    thresholds_file: ThresholdsFile
     hub: LiveHub
     ui: UiAuth
     transport: Transport | None
@@ -121,7 +124,7 @@ def _client_id(request: Request) -> str:
 
 
 def build_state(settings: Settings, transport: Transport | None, clock: Callable[[], float]) -> AppState:
-    thresholds = load_thresholds(settings.thresholds_file)
+    thresholds_file = ThresholdsFile(settings.thresholds_file)
     if transport is None and settings.clickhouse_enabled:
         transport = HttpTransport(
             base_url=settings.clickhouse_url,
@@ -147,8 +150,9 @@ def build_state(settings: Settings, transport: Transport | None, clock: Callable
         settings=settings,
         tokens=ProbeTokens(settings.probe_tokens_file, settings.probe_tokens_reload_s),
         dedup=RecentKeys(settings.dedup_ttl_s, settings.dedup_max_keys),
+        thresholds_file=thresholds_file,
         hub=LiveHub(
-            thresholds,
+            thresholds_file.current,
             retention_s=settings.live_retention_s,
             session_expiry_s=settings.live_session_expiry_s,
             no_data_after_s=settings.no_data_after_s,
@@ -337,6 +341,63 @@ def create_app(
             return JSONResponse({"error": "history unavailable: storage query failed"}, status_code=503)
         return JSONResponse(data)
 
+    # -- probe path validation (EdgeConnect flow export) ---------------------
+    async def _paths(minutes: int, only: str | None) -> JSONResponse:
+        if state.transport is None:
+            return JSONResponse({"error": "paths unavailable: ClickHouse is disabled"}, status_code=503)
+        now_ms = int(state.clock() * 1000)
+        try:
+            rows = await query_paths(state.transport, now_ms - minutes * 60_000)
+        except ClickHouseError as exc:
+            log.warning("path query failed: %s", exc)
+            return JSONResponse({"error": "paths unavailable: storage query failed"}, status_code=503)
+        out: dict[str, Any] = {}
+        for key, st in list(state.hub.sessions.items()):
+            if st.kind != "stamp" or (only is not None and key != only):
+                continue
+            out[key] = analyse(st.src, st.dst, st.dscp, st.app_class, rows, minutes)
+        if only is not None and only not in out:
+            return JSONResponse({"error": "no live STAMP session with that name"}, status_code=404)
+        return JSONResponse({"server_ms": now_ms, "minutes": minutes, "paths": out})
+
+    @app.get("/v1/paths")
+    async def paths(request: Request, minutes: int = 5) -> JSONResponse:
+        """Path summary for every live STAMP session (the dashboard polls this)."""
+        if not ui_ok(request):
+            return unauthorized()
+        if not 1 <= minutes <= 60:
+            return JSONResponse({"error": "minutes must be 1-60"}, status_code=400)
+        return await _paths(minutes, None)
+
+    @app.get("/v1/sessions/{probe_id}/{session}/path")
+    async def session_path(request: Request, probe_id: str, session: str, minutes: int = 10) -> JSONResponse:
+        if not ui_ok(request):
+            return unauthorized()
+        if not _NAME_RE.match(probe_id) or not _NAME_RE.match(session):
+            return JSONResponse({"error": "invalid probe_id or session"}, status_code=400)
+        if not 1 <= minutes <= 60:
+            return JSONResponse({"error": "minutes must be 1-60"}, status_code=400)
+        return await _paths(minutes, f"{probe_id}/{session}")
+
+    # -- EdgeConnect tunnel health (Orchestrator, via buffmon-orch-poll) -----
+    @app.get("/v1/tunnels")
+    async def tunnels(request: Request, minutes: int = 15, appliance: str = "") -> JSONResponse:
+        if not ui_ok(request):
+            return unauthorized()
+        if not 1 <= minutes <= 1440:
+            return JSONResponse({"error": "minutes must be 1-1440"}, status_code=400)
+        if appliance and not _NAME_RE.match(appliance):
+            return JSONResponse({"error": "invalid appliance"}, status_code=400)
+        if state.transport is None:
+            return JSONResponse({"error": "tunnels unavailable: ClickHouse is disabled"}, status_code=503)
+        now_ms = int(state.clock() * 1000)
+        try:
+            rows = await query_tunnels(state.transport, now_ms - minutes * 60_000, appliance)
+        except ClickHouseError as exc:
+            log.warning("tunnel query failed: %s", exc)
+            return JSONResponse({"error": "tunnels unavailable: storage query failed"}, status_code=503)
+        return JSONResponse({"server_ms": now_ms, "minutes": minutes, "tunnels": rows})
+
     # -- live WebSocket -------------------------------------------------------
     @app.websocket("/v1/live")
     async def live(ws: WebSocket) -> None:
@@ -454,3 +515,5 @@ async def _housekeeping(state: AppState, stop: asyncio.Event) -> None:
         if dropped:
             log.info("expired %d idle sessions from the live view", dropped)
         state.tokens.maybe_reload()
+        if state.thresholds_file.maybe_reload():
+            state.hub.set_thresholds(state.thresholds_file.current)

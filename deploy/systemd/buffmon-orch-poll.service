@@ -1,0 +1,67 @@
+[Unit]
+Description=buffmon Orchestrator poller (read-only -> ClickHouse tunnel_stats / alarms)
+Documentation=https://github.com/robertsonc/buffmon/blob/main/deploy/orchestrator/README.md
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+# Run `buffmon-orch-poll --mapping ... --once --dry-run` by hand first.
+ExecStart=/opt/buffmon/venv/bin/buffmon-orch-poll --mapping /etc/buffmon/orchestrator/mapping.10.x.yaml
+Restart=on-failure
+RestartSec=30s
+
+# e.g. https://orchestrator.example/gms/rest
+Environment=BUFFMON_ORCH_URL=https://orchestrator.example/gms/rest
+# Use an Orchestrator API key with a READ-ONLY role. The client only sends GET
+# plus the reads allowed by the POST policy below, but least privilege should
+# not rely on the client alone: the tunnel configuration endpoints return IPsec
+# fields to any key that can read them.
+LoadCredential=orch-token:/etc/buffmon/orch-token
+Environment=BUFFMON_ORCH_TOKEN_FILE=%d/orch-token
+# POST allowlist (deploy/orchestrator/post-allowlist.yaml): root-owned, 0644.
+# The poller refuses to start without it if the mapping has a POST collector,
+# and refuses it if group or others can write it.
+Environment=BUFFMON_ORCH_POST_POLICY=/etc/buffmon/orchestrator/post-allowlist.yaml
+# Kill switch: uncomment to send no POST at all (POST collectors switched off).
+#Environment=BUFFMON_ORCH_DENY_POSTS=1
+Environment=BUFFMON_CLICKHOUSE_URL=http://127.0.0.1:8123
+Environment=BUFFMON_CLICKHOUSE_USER=buffmon
+# BUFFMON_CLICKHOUSE_PASSWORD: root-owned 0600 file, read by systemd before
+# privileges are dropped.
+EnvironmentFile=/etc/buffmon/orch-poll.env
+
+# --- Privileges: none. ---------------------------------------------------------
+DynamicUser=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=yes
+
+# --- Hardening -----------------------------------------------------------------
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectHostname=yes
+ProtectClock=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+UMask=0077
+
+MemoryMax=512M
+TasksMax=64
+
+[Install]
+WantedBy=multi-user.target

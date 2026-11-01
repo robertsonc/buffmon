@@ -51,6 +51,14 @@
       </div>
     </div>
     <div id="sites"></div>
+    <section class="ec" id="ec" hidden>
+      <div class="site-head">
+        <h2>EdgeConnect tunnels</h2>
+        <span class="probe">from Orchestrator · last 15 min</span>
+        <span class="counts" id="ec-counts"></span>
+      </div>
+      <div id="ec-body"></div>
+    </section>
   </main>
 
   <div class="scrim" id="scrim" hidden></div>
@@ -86,6 +94,14 @@
       </div>
       <canvas class="chart" id="d-hist"></canvas>
       <div class="hist-note" id="d-hist-note"></div>
+    </section>
+    <section>
+      <h3>Path · EdgeConnect flow export</h3>
+      <div id="d-path"></div>
+    </section>
+    <section>
+      <h3>EdgeConnect tunnels on this path · Orchestrator</h3>
+      <div id="d-tunnels"></div>
     </section>
     <section>
       <h3>Session</h3>

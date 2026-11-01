@@ -36,6 +36,10 @@ integration = [
 buffmon-ingest = "buffmon.__main__:main"
 buffmon-mint-token = "buffmon.tools.mint_token:main"
 buffmon-simulate = "buffmon.tools.simulate:main"
+buffmon-flows = "buffmon.flows.consumer:main"
+buffmon-orch-discover = "buffmon.orch.swagger:main"
+buffmon-orch-poll = "buffmon.orch.poller:main"
+buffmon-orch-policy = "buffmon.orch.policy_cli:main"
 
 [tool.setuptools.packages.find]
 include = ["buffmon*"]

@@ -50,3 +50,21 @@ classes:
     rtt_p95_ms: { good: 300, bad: 800 }
     loss_pct: { good: 2.0, bad: 5.0 }
     jitter_ms: null
+
+# Per-target overrides. Ordered: the first override whose `match` fits a
+# session wins; metrics it does not set come from the session's app class.
+# `match` takes shell-style globs (case-sensitive) on site, probe_id, session
+# and app_class; every given field must match. The file is re-read within
+# 30 s of an edit; an invalid edit is logged and ignored.
+#
+# Use overrides for physics, not to hide problems: set them from the site's
+# measured best-path RTT, and keep loss limits at the class value.
+overrides: []
+#  - name: lon-to-dc1
+#    match: { site: "LON-*", session: "dc1-*" }
+#    note: "London -> DC1 best path is ~140 ms RTT (transatlantic)"
+#    rtt_p95_ms: { good: 180, bad: 300 }
+#  - name: sin-to-dc1-voice
+#    match: { site: "SIN-*", session: "dc1-voice" }
+#    rtt_p95_ms: { good: 200, bad: 350 }
+#    jitter_ms: { good: 40, bad: 60 }
