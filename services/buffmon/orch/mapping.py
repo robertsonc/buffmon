@@ -32,7 +32,7 @@ from urllib.parse import quote
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
-from .client import dig
+from .client import READ_ONLY_POSTS, dig
 
 FieldType = Literal["datetime", "str", "float", "int"]
 Convert = Literal[
@@ -90,6 +90,7 @@ NORMALIZED: dict[str, dict[str, NormField]] = {
         "appliance": NormField(type="str"),
         "severity": NormField(type="str"),
         "source": NormField(type="str"),
+        "name": NormField(type="str"),
         "object": NormField(type="str"),
         "description": NormField(type="str"),
         "state": NormField(type="str"),
@@ -117,6 +118,8 @@ class FieldMap(BaseModel):
     # Regex applied to the raw value first; the first group is kept. No match
     # gives `default`. E.g. a WAN label inside a tunnel alias.
     pattern: str | None = None
+    # Raw values that mean "no value" (e.g. a cleared time of 0).
+    null_if: list[str | int | float] = []
 
     @model_validator(mode="after")
     def _pattern_compiles(self) -> Self:
@@ -153,10 +156,17 @@ class Collector(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     enabled: bool = False
-    # Fixed: the client cannot send anything else.
-    method: Literal["GET"] = "GET"
+    # GET, or POST for an endpoint in client.READ_ONLY_POSTS (reads Orchestrator
+    # only offers as POST). Any other POST fails validation and is refused by
+    # the client before sending.
+    method: Literal["GET", "POST"] = "GET"
     path: str | None = None
     params: dict[str, str | int | float | bool] = {}
+    # JSON body for an approved read-only POST. A string value that is exactly
+    # "{appliance_ids}" becomes the list of inventory appliance ids (sent in
+    # chunks of `body_chunk`).
+    body: dict[str, Any] | None = None
+    body_chunk: int = Field(default=200, ge=1, le=5000)
     interval_s: int = Field(default=60, ge=10, le=3600)
     # Where the records are in the response: "" = the response itself; dotted path otherwise.
     records: str | None = None
@@ -240,6 +250,18 @@ class MappingFile(BaseModel):
             if placeholders - FAN_OUT_FIELDS:
                 problems.append(f"{where} path placeholders {sorted(placeholders - FAN_OUT_FIELDS)} "
                                 f"are not inventory fields ({', '.join(sorted(FAN_OUT_FIELDS))})")
+            if col.method == "POST":
+                if col.path not in READ_ONLY_POSTS:
+                    problems.append(f"{where} method POST is only allowed for the approved read-only POSTs "
+                                    f"({', '.join(sorted(READ_ONLY_POSTS))}); {col.path!r} is not one of them")
+                if col.body is None:
+                    problems.append(f"{where} method POST needs a body")
+            elif col.body is not None:
+                problems.append(f"{where} a GET collector cannot have a body")
+            if _uses_appliance_ids(col.body):
+                inv = self.collectors.get("appliances")
+                if inv is None or not inv.enabled:
+                    problems.append(f"{where} body uses {{appliance_ids}}, which needs the appliances collector")
             in_params = {p for v in col.params.values() if isinstance(v, str) for p in _PLACEHOLDER.findall(v)}
             allowed = (FAN_OUT_FIELDS if col.fan_out else set()) | (BUCKET_FIELDS if col.buckets else set())
             if in_params - allowed:
@@ -298,7 +320,7 @@ def _to_datetime(raw: Any, convert: str) -> datetime:
 
 def convert_value(raw: Any, fm: FieldMap, ftype: FieldType) -> Any:
     """Applies map -> convert -> scale, then coerces to the normalized type."""
-    if raw is None:
+    if raw is None or (fm.null_if and raw in fm.null_if):
         return fm.default
     if isinstance(raw, dict | list):
         raise ConversionError(f"expected a scalar, got {type(raw).__name__}")
@@ -424,6 +446,30 @@ def render_params(params: Mapping[str, str | int | float | bool], ctx: Mapping[s
         return str(value)
 
     return {k: _PLACEHOLDER.sub(sub, v) if isinstance(v, str) else v for k, v in params.items()}
+
+
+APPLIANCE_IDS = "{appliance_ids}"
+
+
+def _uses_appliance_ids(body: Any) -> bool:
+    if body == APPLIANCE_IDS:
+        return True
+    if isinstance(body, dict):
+        return any(_uses_appliance_ids(v) for v in body.values())
+    if isinstance(body, list):
+        return any(_uses_appliance_ids(v) for v in body)
+    return False
+
+
+def render_body(body: Any, appliance_ids: list[str]) -> Any:
+    """Replaces every "{appliance_ids}" string in the body with the id list."""
+    if body == APPLIANCE_IDS:
+        return list(appliance_ids)
+    if isinstance(body, dict):
+        return {k: render_body(v, appliance_ids) for k, v in body.items()}
+    if isinstance(body, list):
+        return [render_body(v, appliance_ids) for v in body]
+    return body
 
 
 def bucket_context(start_s: int, end_s: int) -> dict[str, Any]:

@@ -24,7 +24,10 @@ MAPPING = load_mapping(DEPLOY / "mapping.10.x.yaml")
 def test_shipped_10x_mapping_is_complete_and_get_only() -> None:
     assert MAPPING.auth.mode == "header" and MAPPING.auth.header_name == "X-Auth-Token"
     assert set(MAPPING.enabled()) == {"appliances", "tunnel_stats", "alarms"}
-    assert all(c.method == "GET" for c in MAPPING.collectors.values())
+    # Every collector is GET except alarms: the one approved read-only POST.
+    assert {n: c.method for n, c in MAPPING.collectors.items()} == \
+        {"appliances": "GET", "tunnel_stats": "GET", "alarms": "POST"}
+    assert MAPPING.collectors["alarms"].path == "/alarm/appliance"
     ts = MAPPING.collectors["tunnel_stats"]
     assert ts.fan_out == "appliances" and ts.buckets == Buckets(size_s=60, lag_s=120, count=3)
     # LIVE: seconds, not the milliseconds the export documents.
@@ -106,12 +109,12 @@ def test_poller_requests_against_the_shipped_mapping(tmp_path: Path, capsys: pyt
 
     def h(r: httpx.Request) -> httpx.Response:
         seen.append(r)
-        if r.url.path.endswith("/appliance"):
+        if r.url.path.endswith("/appliance") and r.method == "GET":
             return httpx.Response(200, json=[{"nePk": "1.NE", "hostName": "ec-a-01", "site": "A"},
                                              {"nePk": "2.NE", "hostName": "ec-a-02", "site": "A"}])
         if r.url.path.endswith("/stats/aggregate/tunnel"):
             return httpx.Response(200, json=agg)
-        if r.url.path.endswith("/alarm/correlatedAlarms"):
+        if r.url.path.endswith("/alarm/appliance") and r.method == "POST":
             return httpx.Response(200, json=[])
         return httpx.Response(404, json={})
 
@@ -121,7 +124,7 @@ def test_poller_requests_against_the_shipped_mapping(tmp_path: Path, capsys: pyt
                  "--token-file", str(token), "--once", "--dry-run"], transport=httpx.MockTransport(h))
     out = capsys.readouterr()
     assert code == 0, out.err
-    assert all(r.method == "GET" for r in seen)
+    assert all(r.method == "GET" or r.url.path == "/gms/rest/alarm/appliance" for r in seen)
     assert all(r.headers.get("x-auth-token") == "synthetic-token" for r in seen)
     stats = [r for r in seen if r.url.path.endswith("/stats/aggregate/tunnel")]
     assert len(stats) == 2 * 3, "one request per appliance per bucket"
@@ -131,3 +134,123 @@ def test_poller_requests_against_the_shipped_mapping(tmp_path: Path, capsys: pyt
         assert r.url.params["groupByNE"] in ("false", "False")
     rows = [json.loads(line) for line in out.out.splitlines()]
     assert sum(1 for r in rows if r["collector"] == "tunnel_stats") == 2 * 3 * 3
+
+
+# -- approved read-only POST (/alarm/appliance) -----------------------------------------
+
+ALARMS_FIXTURE = Path(__file__).resolve().parent / "fixtures" / "orch" / "alarm_appliance_10x.json"
+
+
+def _client(handler: Any) -> Any:
+    from pydantic import SecretStr
+
+    from buffmon.orch.client import AuthConfig, ClientConfig, OrchClient
+
+    return OrchClient(
+        ClientConfig(base_url="https://orch.synthetic.invalid/gms/rest",
+                     auth=AuthConfig(mode="header", header_name="X-Auth-Token", token=SecretStr("synthetic-token")),
+                     backoff_base_s=0.0, backoff_max_s=0.0),
+        transport=httpx.MockTransport(handler),
+    )
+
+
+def test_only_the_approved_post_path_can_be_sent() -> None:
+    import asyncio
+
+    from buffmon.orch.client import READ_ONLY_POSTS, ReadOnlyViolationError
+
+    assert frozenset({"/alarm/appliance"}) == READ_ONLY_POSTS, "adding a POST needs explicit approval"
+    seen: list[httpx.Request] = []
+
+    def h(r: httpx.Request) -> httpx.Response:
+        seen.append(r)
+        return httpx.Response(200, json=[])
+
+    async def go() -> None:
+        c = _client(h)
+        try:
+            assert await c.post_read_json("/alarm/appliance", {"view": "active"}, {"nePks": ["1.NE"]}) == []
+            with pytest.raises(ReadOnlyViolationError):
+                await c.post_read_json("/alarm/acknowledgement/appliance", None, {"ids": [1]})
+            with pytest.raises(ReadOnlyViolationError):  # the request hook, if anything bypasses post_read_json
+                await c._client.post("/alarm/clearance/appliance", json={})
+            with pytest.raises(ReadOnlyViolationError):  # same path, but outside the API base
+                await c._client.post("https://orch.synthetic.invalid/other/alarm/appliance", json={})
+        finally:
+            await c.aclose()
+
+    asyncio.run(go())
+    assert [(r.method, r.url.path) for r in seen] == [("POST", "/gms/rest/alarm/appliance")]
+    assert json.loads(seen[0].content) == {"nePks": ["1.NE"]}
+
+
+def test_approved_post_is_retried_like_a_read() -> None:
+    import asyncio
+
+    calls = {"n": 0}
+
+    def h(r: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(503) if calls["n"] == 1 else httpx.Response(200, json=[{"id": 1}])
+
+    async def go() -> Any:
+        c = _client(h)
+        try:
+            return await c.post_read_json("/alarm/appliance", None, {"nePks": ["1.NE"]})
+        finally:
+            await c.aclose()
+
+    assert asyncio.run(go()) == [{"id": 1}] and calls["n"] == 2
+
+
+@pytest.mark.parametrize("collector,match", [
+    ({"method": "POST", "path": "/synthetic/alarms", "body": {"x": 1}}, "approved read-only POSTs"),
+    ({"method": "POST", "path": "/alarm/appliance"}, "needs a body"),
+    ({"method": "GET", "path": "/synthetic/alarms", "body": {"x": 1}}, "cannot have a body"),
+    ({"method": "POST", "path": "/alarm/appliance", "body": {"nePks": "{appliance_ids}"}}, "appliances collector"),
+])
+def test_post_collectors_are_validated(collector: dict[str, Any], match: str) -> None:
+    raw = _base(**collector)
+    with pytest.raises(ValidationError, match=match):
+        MappingFile.model_validate(raw)
+
+
+def test_live_shaped_alarms_normalize_through_the_shipped_mapping() -> None:
+    records = json.loads(ALARMS_FIXTURE.read_text())["records"]
+    rows, problems = normalize("alarms", MAPPING.collectors["alarms"], records, datetime.now(tz=UTC), "10.0")
+    assert problems == []
+    bgp, tun = rows
+    assert (bgp["alarm_id"], bgp["appliance"], bgp["severity"]) == ("101", "ec-a-01", "MAJOR")
+    assert (bgp["source"], bgp["name"], bgp["object"]) == ("SW", "BGP peer down", "192.0.2.10")
+    assert bgp["state"] == "active" and bgp["cleared_ts"] is None, "clearedTimeInMills 0 means not cleared"
+    assert tun["state"] == "closed" and tun["cleared_ts"] == "2026-10-31 12:15:04.000"
+
+
+def test_alarm_post_sends_inventory_ids_in_chunks(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    import yaml
+
+    raw = yaml.safe_load((DEPLOY / "mapping.10.x.yaml").read_text())
+    raw["collectors"]["alarms"]["body_chunk"] = 2
+    raw["collectors"]["tunnel_stats"]["enabled"] = False
+    mapping = tmp_path / "m.yaml"
+    mapping.write_text(yaml.safe_dump(raw))
+    records = json.loads(ALARMS_FIXTURE.read_text())["records"]
+    seen: list[httpx.Request] = []
+
+    def h(r: httpx.Request) -> httpx.Response:
+        seen.append(r)
+        if r.url.path.endswith("/appliance") and r.method == "GET":
+            return httpx.Response(200, json=[{"nePk": f"{i}.NE", "hostName": f"ec-{i}", "site": "A"} for i in range(5)])
+        if r.url.path.endswith("/alarm/appliance") and r.method == "POST":
+            return httpx.Response(200, json=records[:1])
+        return httpx.Response(404, json={})
+
+    token = tmp_path / "token"
+    token.write_text("synthetic-token")
+    code = main(["--mapping", str(mapping), "--url", "https://orch.synthetic.invalid/gms/rest",
+                 "--token-file", str(token), "--once", "--dry-run"], transport=httpx.MockTransport(h))
+    assert code == 0, capsys.readouterr().err
+    posts = [r for r in seen if r.method == "POST"]
+    assert [json.loads(r.content)["nePks"] for r in posts] == [["0.NE", "1.NE"], ["2.NE", "3.NE"], ["4.NE"]]
+    assert all(r.url.params["view"] == "active" for r in posts)
+    assert {r.method for r in seen} == {"GET", "POST"} and all(r.url.path.endswith("/alarm/appliance") for r in posts)

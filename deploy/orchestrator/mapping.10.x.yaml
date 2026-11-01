@@ -97,25 +97,34 @@ collectors:
       bytes_tx:           { from: SUM_WTX_BYTES }
       bytes_rx:           { from: SUM_WRX_BYTES }
 
-  # GET /alarm/correlatedAlarms?view=active: Orchestrator's correlated
-  # (root-cause) alarm view. The full per-appliance list is POST /alarm/appliance,
-  # which the read-only client will not send.
-  # LIVE: returns a JSON list (empty on the lab at the time, so the field
-  # mapping below is from the export's schema, not yet seen with data).
+  # POST /alarm/appliance — a READ that Orchestrator only offers as POST. It is
+  # one of the client's code-level READ_ONLY_POSTS (approved by the deployment
+  # owner 2026-11-01); a POST to any other path is refused before sending.
+  # Body {"nePks": [...]} from the inventory, in chunks of body_chunk.
+  # view=active each minute: the table shows what is active now (an alarm's
+  # latest ingested_at says when it was last seen active). Closure history stays
+  # in Orchestrator.
   alarms:
     enabled: true
-    path: /alarm/correlatedAlarms
-    params: { view: active, maxAlarms: 1000 }
+    method: POST
+    path: /alarm/appliance
+    params: { view: active, maxAlarms: 5000 }
+    body: { nePks: "{appliance_ids}" }
+    body_chunk: 200
     interval_s: 60
     fan_out: null
     records: ""
     fields:
       ts:          { from: timeOccurredInMills, convert: epoch_ms }
       alarm_id:    { from: id }
-      appliance:   { from: source }
-      severity:    { from: severity }
-      source:      { from: name }
-      object:      { from: type }
+      appliance:   { from: hostName }
+      severity:    { from: severity }               # WARNING / MINOR / MAJOR / CRITICAL
+      # LIVE: `type` is the category (SW, TUN, ...); the API's `source` is the
+      # affected object (a prefix, tunnel, BGP peer address), not the subsystem
+      # the export describes; `name` is the alarm name.
+      source:      { from: type }
+      name:        { from: name }                   # e.g. "BGP peer down", passthrough_tunnel_down
+      object:      { from: source }                 # e.g. 172.18.255.238, Passthrough_lan1.1802
       description: { from: description }
-      state:       { from: null, default: active }
-      cleared_ts:  { from: null }
+      state:       { from: closed, map: { "False": active, "True": closed } }
+      cleared_ts:  { from: clearedTimeInMills, convert: epoch_ms, null_if: [0] }

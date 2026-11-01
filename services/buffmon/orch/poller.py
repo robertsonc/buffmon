@@ -46,6 +46,7 @@ from .mapping import (
     bucket_context,
     load_mapping,
     normalize,
+    render_body,
     render_params,
     render_path,
 )
@@ -124,18 +125,30 @@ class Poller:
         for window in windows:
             full_ctx = {**(ctx or {}), **window}
             params = render_params(col.params, full_ctx)
-            response = await self.client.get_json(path, params)
-            got, problems = normalize(name, col, response, now, self.mapping.orchestrator_version, full_ctx)
-            rows.extend(got)
-            for p in problems[:5]:
-                log.warning("%s: %s", path, p)
-            if len(problems) > 5:
-                log.warning("%s: %d more records skipped", path, len(problems) - 5)
-            self.problems += len(problems)
+            if col.method == "POST":
+                ids = [str(r["appliance_id"]) for r in self.inventory]
+                responses = [
+                    await self.client.post_read_json(
+                        path, params, render_body(col.body, ids[i:i + col.body_chunk])
+                    )
+                    for i in range(0, max(len(ids), 1), col.body_chunk)
+                ]
+            else:
+                responses = [await self.client.get_json(path, params)]
+            for response in responses:
+                got, problems = normalize(name, col, response, now, self.mapping.orchestrator_version, full_ctx)
+                rows.extend(got)
+                for p in problems[:5]:
+                    log.warning("%s: %s", path, p)
+                if len(problems) > 5:
+                    log.warning("%s: %d more records skipped", path, len(problems) - 5)
+                self.problems += len(problems)
         return rows
 
     async def poll(self, name: CollectorName) -> list[dict[str, Any]]:
         col = self.mapping.collectors[name]
+        if col.method == "POST" and not self.inventory and name != "appliances":
+            await self.poll("appliances")
         if col.fan_out == "appliances":
             if not self.inventory:
                 await self.poll("appliances")

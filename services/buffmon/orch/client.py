@@ -8,12 +8,16 @@ Read-only is enforced, not promised:
 * an httpx request hook re-checks every outgoing request, so even code that
   reaches the underlying client directly cannot send a write.
 
-The single, documented exception is the login request declared in the mapping
-file (``auth.mode: login``). It is sent at most once per login, never retried,
-and only while :meth:`OrchClient.login` is running.
+Two documented exceptions:
 
-No endpoint, header name or field name is built in: they all come from the
-mapping file and the deployment's settings.
+* the login request declared in the mapping file (``auth.mode: login``), sent at
+  most once per login, never retried, only while :meth:`OrchClient.login` runs;
+* :data:`READ_ONLY_POSTS`: endpoints that only *read* but which Orchestrator
+  exposes as POST. Each one is listed here by name, in code, after explicit
+  approval from the deployment owner, so a mapping edit can never add one.
+
+Apart from that list, no endpoint, header name or field name is built in: they
+come from the mapping file and the deployment's settings.
 """
 
 from __future__ import annotations
@@ -34,6 +38,17 @@ import httpx
 from pydantic import SecretStr
 
 log = logging.getLogger(__name__)
+
+# Read-only operations that Orchestrator only offers as POST. Adding an entry is
+# a code change with review, never a mapping edit. Paths are relative to the
+# API base (e.g. /gms/rest).
+READ_ONLY_POSTS: frozenset[str] = frozenset({
+    # "Retrieve appliance alarms for specified appliances" (Orchestrator 10.x:
+    # body {"nePks": [...]}, returns the alarm list). The GET alternative,
+    # /alarm/correlatedAlarms, only returns the correlated root-cause view.
+    # Approved by the deployment owner on 2026-11-01.
+    "/alarm/appliance",
+})
 
 TRANSIENT_STATUS = frozenset({429, 500, 502, 503, 504})
 ParamValue = str | int | float | bool
@@ -178,6 +193,9 @@ class OrchClient:
             follow_redirects=False,
             event_hooks={"request": [self._guard]},
         )
+        # Exact URL paths (API base + allow-listed path) the request hook lets POST through.
+        base_path = httpx.URL(cfg.base_url).path.rstrip("/")
+        self._read_only_post_paths = frozenset(base_path + p for p in READ_ONLY_POSTS)
         self._sem = asyncio.Semaphore(cfg.max_concurrency)
         self._slot_lock = asyncio.Lock()
         self._next_slot = 0.0
@@ -205,6 +223,8 @@ class OrchClient:
     async def _guard(self, request: httpx.Request) -> None:
         """Last line of defence: runs for every request the httpx client sends."""
         if request.method == "GET":
+            return
+        if request.method == "POST" and request.url.path in self._read_only_post_paths:
             return
         login = self.cfg.auth.login
         if (
@@ -301,10 +321,28 @@ class OrchClient:
 
     async def get_json(self, path: str, params: Mapping[str, ParamValue] | None = None) -> Any:
         """GET ``path`` and return the decoded JSON, retrying transient failures."""
+        return await self._send("GET", path, params, None)
+
+    async def post_read_json(
+        self, path: str, params: Mapping[str, ParamValue] | None, body: Any
+    ) -> Any:
+        """POST to one of :data:`READ_ONLY_POSTS` (reads that Orchestrator exposes
+        as POST). Any other path raises before a byte is sent. Retried like a
+        GET: the operation only reads, so repeating it is safe."""
+        if path not in READ_ONLY_POSTS:
+            raise ReadOnlyViolationError(
+                f"refused to send POST {path}: not one of the approved read-only POSTs "
+                f"({', '.join(sorted(READ_ONLY_POSTS))})"
+            )
+        return await self._send("POST", path, params, body)
+
+    async def _send(
+        self, method: str, path: str, params: Mapping[str, ParamValue] | None, json_body: Any
+    ) -> Any:
         if self.cfg.auth.mode == "login" and not self._logged_in:
             await self.login()
         q = {k: (str(v).lower() if isinstance(v, bool) else v) for k, v in (params or {}).items()}
-        what = f"GET {path}"
+        what = f"{method} {path}"
         last: OrchError | None = None
         relogged = False
         attempt = 0
@@ -316,7 +354,10 @@ class OrchClient:
             async with self._sem:
                 try:
                     async with asyncio.timeout(self.cfg.timeout_s):
-                        resp = await self._client.get(path, params=q, headers=self._auth_headers())
+                        if method == "GET":
+                            resp = await self._client.get(path, params=q, headers=self._auth_headers())
+                        else:
+                            resp = await self._client.post(path, params=q, json=json_body, headers=self._auth_headers())
                         body = resp.content
                 except TimeoutError:
                     last = OrchTimeoutError(f"{what}: no complete response within {self.cfg.timeout_s:g} s")

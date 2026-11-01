@@ -16,7 +16,8 @@ RestartSec=30s
 # e.g. https://orchestrator.example/gms/rest
 Environment=BUFFMON_ORCH_URL=https://orchestrator.example/gms/rest
 # Use an Orchestrator API key with a READ-ONLY role. The client only sends GET
-# requests, but least privilege should not rely on the client alone: the
+# plus one approved read-only POST (/alarm/appliance), but least privilege
+# should not rely on the client alone: the
 # tunnel configuration endpoints return IPsec fields to any key that can read them.
 LoadCredential=orch-token:/etc/buffmon/orch-token
 Environment=BUFFMON_ORCH_TOKEN_FILE=%d/orch-token

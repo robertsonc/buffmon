@@ -39,20 +39,26 @@ Choices in the 10.x mapping:
 - Loss is stored as **packet counts** before and after FEC (additive) and as
   Orchestrator's per-minute percentage. The percentage scale is the export's
   ("Packet loss percentage"); the lab had no loss to confirm it against.
-- **Alarms** use `GET /alarm/correlatedAlarms` (root-cause view). The full
-  per-appliance alarm list is `POST /alarm/appliance`, which this read-only
-  client will not send.
+- **Alarms** use `POST /alarm/appliance` (the approved read-only POST) with the
+  inventory's appliance ids in the body, `view=active`, every minute. LIVE: the
+  API's `source` is the affected object (prefix, tunnel, BGP peer), not the
+  subsystem the export describes; `type` is the category (SW, TUN, ...); `name`
+  is the alarm name. Closure history stays in Orchestrator.
 - The tunnel configuration endpoints (`/tunnels2/physical`) return IPsec fields
   including pre-shared keys to any key with read access. The poller never
   calls them, but use a **read-only** API key and treat it as sensitive.
 
 ## Ground rules
 
-- **Read-only.** The client can only send GET. Any other method raises before
-  a byte leaves the host, and a second check runs on every outgoing request.
-  The one exception is the login request you declare in `auth.login` (if your
-  release uses session login rather than an API token); it is sent once per
-  login and never retried.
+- **Read-only.** The client sends GET. Any other method raises before a byte
+  leaves the host, and a second check runs on every outgoing request. Two
+  exceptions, both explicit:
+  - the login request you declare in `auth.login` (if your release uses session
+    login rather than an API token), sent once per login and never retried;
+  - `READ_ONLY_POSTS` in `buffmon/orch/client.py`: reads that Orchestrator only
+    offers as POST. Today exactly one, `POST /alarm/appliance` (approved by the
+    deployment owner 2026-11-01). The list lives in code, so a mapping edit
+    cannot add to it; a mapping that declares any other POST fails validation.
 - **Nothing is guessed.** No endpoint path, query parameter, header name or
   response field is built into the code. They come from your Orchestrator's own
   Swagger/OpenAPI export, release by release.

@@ -59,7 +59,11 @@ CREATE TABLE IF NOT EXISTS buffmon.alarms
     site          LowCardinality(String) DEFAULT '',
     appliance     LowCardinality(String) DEFAULT '',
     severity      LowCardinality(String) DEFAULT '',
+    -- alarm category (Orchestrator 10.x: SW, TUN, ...)
     source        LowCardinality(String) DEFAULT '',
+    -- alarm name, e.g. "BGP peer down"
+    name          String DEFAULT '',
+    -- the affected object: a prefix, tunnel, peer address, ...
     object        String DEFAULT '',
     description   String DEFAULT '',
     state         LowCardinality(String) DEFAULT '',
