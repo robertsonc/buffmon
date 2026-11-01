@@ -48,6 +48,8 @@
     return Math.round(sec / 3600) + " h ago";
   }
   function classTh(s) {
+    // The server resolves class + per-target override; prefer that.
+    if (s.thresholds) return s.thresholds;
     var t = S.thresholds;
     if (!t) return null;
     return t.classes[s.effective_class] || t.classes[t.default_class] || null;
@@ -441,7 +443,8 @@
     dl.textContent = "";
     var meta = [
       ["Probe", s.probe_id], ["Source", s.src], ["Target", target(s)],
-      ["DSCP", dscpName(s.dscp)], ["Thresholds", s.effective_class + (s.effective_class !== s.app_class ? " (default)" : "")],
+      ["DSCP", dscpName(s.dscp)], ["Thresholds", s.effective_class + (s.effective_class !== s.app_class ? " (default)" : "") +
+        (s.threshold_override ? " · override " + s.threshold_override : "")],
       ["TTL → / ←", (s.ttl_fwd == null ? "–" : s.ttl_fwd) + " / " + (s.ttl_back == null ? "–" : s.ttl_back)],
       ["Receive timestamps", s.rx_ts === "kernel" ? "kernel" : "user space (less precise)"],
       ["Clock sync", s.clock_synced ? "synchronised" + (s.clock_err_us != null ? " (±" + s.clock_err_us + " µs)" : "")

@@ -27,7 +27,7 @@ from .dedup import RecentKeys
 from .live import WINDOWS_S, LiveHub
 from .models import NAME_PATTERN, IngestBatch, ProbeRecord
 from .store import HISTORY_RANGES, ClickHouseError, HttpTransport, SampleWriter, Transport, query_history, record_to_row
-from .thresholds import load_thresholds
+from .thresholds import ThresholdsFile
 from .uiauth import COOKIE_NAME, UiAuth
 
 log = logging.getLogger(__name__)
@@ -60,6 +60,7 @@ class AppState:
     settings: Settings
     tokens: ProbeTokens
     dedup: RecentKeys
+    thresholds_file: ThresholdsFile
     hub: LiveHub
     ui: UiAuth
     transport: Transport | None
@@ -121,7 +122,7 @@ def _client_id(request: Request) -> str:
 
 
 def build_state(settings: Settings, transport: Transport | None, clock: Callable[[], float]) -> AppState:
-    thresholds = load_thresholds(settings.thresholds_file)
+    thresholds_file = ThresholdsFile(settings.thresholds_file)
     if transport is None and settings.clickhouse_enabled:
         transport = HttpTransport(
             base_url=settings.clickhouse_url,
@@ -147,8 +148,9 @@ def build_state(settings: Settings, transport: Transport | None, clock: Callable
         settings=settings,
         tokens=ProbeTokens(settings.probe_tokens_file, settings.probe_tokens_reload_s),
         dedup=RecentKeys(settings.dedup_ttl_s, settings.dedup_max_keys),
+        thresholds_file=thresholds_file,
         hub=LiveHub(
-            thresholds,
+            thresholds_file.current,
             retention_s=settings.live_retention_s,
             session_expiry_s=settings.live_session_expiry_s,
             no_data_after_s=settings.no_data_after_s,
@@ -454,3 +456,5 @@ async def _housekeeping(state: AppState, stop: asyncio.Event) -> None:
         if dropped:
             log.info("expired %d idle sessions from the live view", dropped)
         state.tokens.maybe_reload()
+        if state.thresholds_file.maybe_reload():
+            state.hub.set_thresholds(state.thresholds_file.current)

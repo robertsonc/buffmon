@@ -3,11 +3,12 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
+import yaml
 
 from buffmon import live as live_mod
 from buffmon.live import LiveHub
 from buffmon.models import ProbeRecord
-from buffmon.thresholds import load_thresholds
+from buffmon.thresholds import Thresholds, load_thresholds
 from tests.conftest import THRESHOLDS, lossy, make_record
 
 T0 = 1_761_955_200_000
@@ -187,3 +188,23 @@ def test_snapshot_is_sorted_and_cached(hub: LiveHub, clock: Clock) -> None:
     snap = hub.snapshot()
     assert [s["site"] for s in snap] == ["A-SITE", "B-SITE"]
     assert hub.snapshot() is snap
+
+
+def test_per_target_override_changes_the_grade_and_reload_regrades(hub: LiveHub, clock: Clock) -> None:
+    # A London site whose best path to DC1 is ~150 ms: degraded against the voice class...
+    feed(hub, clock, 40, site="LON-BR03", sent=20, received=20, rtt_us=[150_000] * 20, rtt_jitter_n=19,
+         ipdv_fwd_n=19, ipdv_back_n=19)
+    s = summary(hub)
+    assert s["status"] == "degraded" and s["threshold_override"] is None
+    assert s["thresholds"]["rtt_p95_ms"] == {"good": 100.0, "bad": 300.0}
+
+    # ...and good once an override for that site/target is applied.
+    raw = yaml.safe_load(THRESHOLDS.read_text())
+    raw["overrides"] = [{"name": "lon-dc1", "match": {"site": "LON-*", "session": "dc1-*"},
+                         "rtt_p95_ms": {"good": 180, "bad": 300}}]
+    hub.set_thresholds(Thresholds.model_validate(raw))
+    s = summary(hub)
+    assert s["status"] == "good", s["reasons"]
+    assert s["threshold_override"] == "lon-dc1"
+    assert s["thresholds"]["rtt_p95_ms"] == {"good": 180.0, "bad": 300.0}
+    assert s["thresholds"]["loss_pct"] == {"good": 1.0, "bad": 3.0}, "unset metrics keep the class limits"
