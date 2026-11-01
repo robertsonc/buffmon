@@ -124,7 +124,7 @@ collectors:
       # the export describes; `name` is the alarm name.
       source:      { from: type }
       name:        { from: name }                   # e.g. "BGP peer down", passthrough_tunnel_down
-      object:      { from: source }                 # e.g. 172.18.255.238, Passthrough_lan1.1802
+      object:      { from: source }                 # e.g. a BGP peer address, Passthrough_lan1.100
       description: { from: description }
       state:       { from: closed, map: { "False": active, "True": closed } }
       cleared_ts:  { from: clearedTimeInMills, convert: epoch_ms, null_if: [0] }
