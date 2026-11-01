@@ -250,7 +250,7 @@ Per session, over rolling windows:
 |---|---|---|
 | **P1 (this PR)** | STAMP sender + stateful reflector, ICMP, TCP; ingest with auth and dedup; ClickHouse; live dashboard; systemd units | In the lab, loss/latency/jitter per site and target reach the dashboard within 5 s; an injected 2% loss (`tc netem`) shows within 30 s, attributed to the right direction |
 | P2 | EdgeConnect: IPFIX via goflow2 → ClickHouse; Orchestrator poller for tunnel/overlay stats and alarms, 9.7.2 and 10.x; probe path validation; underlay vs delivered loss | Each probe session shows the appliance and interfaces it actually used; pre-FEC vs post-FEC loss next to probe loss |
-| P3 | Path characterisation: Paris-style traceroute with change detection; packet-train capacity estimate | Path changes flagged within one cycle; capacity estimate within ±20% of a known shaped rate on wired lab links |
+| P3 (done, lab-verified) | Path characterisation: Paris-style traceroute with change detection; packet-train capacity estimate | Path changes flagged within one cycle; capacity estimate within ±20% of a known shaped rate on wired lab links |
 | P4 | Identity graph: ClearPass, DHCP, Central/Mist; enrichment on arrival | Any IP at any time resolves to MAC, device and user where the sources know them |
 | P5 | UXI and HPE SSE ingestion; segment view; UXI as control group | One screen shows, per site, which segment is degraded and the evidence for it |
 | P6 | Passive TCP: SPAN sensor where traffic is not proxied or tunnelled; good/bad session % over time; reports | Hourly good-session % per site and app, with the observation point recorded |
@@ -269,6 +269,32 @@ Per session, over rolling windows:
 - Open: EdgeConnect enterprise IPFIX elements (overlay/tunnel per flow), which
   would tie a probe to its overlay directly instead of via its appliance; the
   9.7.2 mapping; Orchestrator's loss-percentage scale under real loss.
+
+### Phase 3 status
+
+Built and verified in a routed network-namespace lab (`probe/lab/netns.sh`,
+acceptance run `probe/lab/verify-p3.sh`): probe → r1 → three alternate paths
+→ r3 → reflector, real binaries, Linux tbf shaping on r3 → reflector.
+
+- **Route changes**: a same-length reroute was flagged by the next scheduled
+  trace (22 s after the change, 30 s interval); a reroute one hop longer was
+  flagged in the same second through the STAMP TTL tripwire. No false changes
+  over 10 further traces; the reflector saw 0 trace packets.
+- **Capacity** (64 × 1200 B trains, 5 per run; expected = tbf rate × 1228/1242,
+  since tbf counts Ethernet framing and the estimate is IP-layer):
+
+  | tbf | expected | sustained estimate | burst, configured → measured | whole-train rate |
+  |---|---|---|---|---|
+  | 20 Mbit/s, 8 KB | 19.77 | 19.79 | 8192 → 8031 B | 21.66 |
+  | 5 Mbit/s, 4 KB | 4.94 | 4.94 | 4096 → 4035 B | 5.13 |
+  | 50 Mbit/s, 16 KB | 49.44 | 49.45 | 16384 → 16008 B | 61.23 |
+  | 10 Mbit/s, 48 KB | 9.89 | 9.89 | 49152 → 48515 B | 25.47 |
+  | return 8 Mbit/s | 7.91 | 7.91 (measured) | | |
+
+- Not verified yet: an EdgeConnect overlay (packet order correction, FEC and
+  per-packet path spraying can re-space trains), real routers' ICMP rate
+  limiting at scale, and capacity above ~1 Gbit/s (interrupt coalescing makes
+  kernel timestamps bunch up).
 
 ## 11. What has to be confirmed in the lab before P2+
 
