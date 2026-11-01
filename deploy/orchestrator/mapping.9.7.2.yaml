@@ -1,0 +1,95 @@
+# buffmon <-> Orchestrator 9.7.2 mapping.
+#
+# EVERYTHING VENDOR-SPECIFIC IN THIS FILE IS DELIBERATELY UNSET (null). Nothing
+# here was guessed: fill each value from the Swagger/OpenAPI export of an
+# Orchestrator running 9.7.2 (see README.md in this directory):
+#
+#   buffmon-orch-discover orch-9.7.2.json                 # candidate GET endpoints
+#   buffmon-orch-discover orch-9.7.2.json --show <path>   # every response field of one
+#   buffmon-orch-discover orch-9.7.2.json --diff orch-10.x.json
+#
+# Then: set enabled: true, run
+#   buffmon-orch-poll --mapping mapping.9.7.2.yaml --once --dry-run
+# and check the printed rows before letting it write.
+#
+# The client is read-only: method is fixed to GET; the only non-GET request it
+# can ever send is auth.login below, if you configure one.
+
+version: 1
+orchestrator_version: "9.7.2"
+source: ""              # e.g. "Swagger export from <orchestrator host>, <date>"
+
+auth:
+  # "header": a static API token sent in a request header (header_name below).
+  # "login":  one login request yields a session cookie or token.
+  # Take this from the export's securityDefinitions / components.securitySchemes.
+  mode: null
+  header_name: null
+  login: null
+  # login:
+  #   method: null        # POST or GET
+  #   path: null
+  #   body: {}            # JSON body; use "${USERNAME}" and "${PASSWORD}" placeholders
+  #   token_field: null   # dotted path to a token in the response (null: session cookie)
+  #   token_header: null  # header that carries that token on later GETs
+
+collectors:
+  # Appliance inventory: used to fan per-appliance requests out and to label
+  # rows with hostname/site. Not stored.
+  appliances:
+    enabled: false
+    path: null
+    params: {}
+    interval_s: 600
+    records: null         # dotted path to the list in the response; "" if the response IS the list
+    fields:
+      appliance_id: { from: null }    # the id other endpoints take in their path
+      hostname:     { from: null }
+      site:         { from: null }
+
+  # Per-tunnel underlay/overlay health: the "underlay loss vs what users got" view.
+  tunnel_stats:
+    enabled: false
+    path: null            # may use {appliance_id} / {hostname} / {site} with fan_out: appliances
+    params: {}
+    interval_s: 60
+    fan_out: null         # "appliances" to run once per inventory row
+    records: null
+    expand: null          # set if each record holds a list of samples to flatten
+    fields:
+      ts:                { from: null, convert: epoch_ms }   # or iso8601 / epoch_s; or from: $now
+      site:              { from: null }                      # falls back to the inventory row
+      appliance:         { from: null }                      # required; $ctx.hostname with fan_out
+      tunnel_id:         { from: null }
+      tunnel_name:       { from: null }
+      overlay:           { from: null }
+      transport:         { from: null }                      # add map: {raw: INET, ...} to relabel
+      peer:              { from: null }
+      loss_pre_fec_pct:  { from: null }                      # convert: fraction_to_pct if 0..1
+      loss_post_fec_pct: { from: null }
+      ooo_pre_poc_pct:   { from: null }
+      ooo_post_poc_pct:  { from: null }
+      latency_ms:        { from: null }                      # convert: us_to_ms / s_to_ms if needed
+      jitter_ms:         { from: null }
+      mos:               { from: null }
+      bytes_tx:          { from: null }
+      bytes_rx:          { from: null }
+
+  alarms:
+    enabled: false
+    path: null
+    params: {}
+    interval_s: 60
+    fan_out: null
+    records: null
+    fields:
+      ts:          { from: null, convert: epoch_ms }
+      alarm_id:    { from: null }
+      site:        { from: null }
+      appliance:   { from: null }
+      severity:    { from: null }
+      source:      { from: null }
+      object:      { from: null }
+      description: { from: null }
+      state:       { from: null }
+      cleared_ts:  { from: null, convert: epoch_ms }

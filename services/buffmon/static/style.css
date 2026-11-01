@@ -320,3 +320,15 @@ canvas.chart { width: 100%; height: 230px; display: block; }
   .metric .sub { white-space: normal; }
   .brand .sub, .site-head .probe { display: none; }
 }
+
+/* ---------- EdgeConnect tunnels ---------- */
+.ec { margin-top: 30px; }
+.ec-app { margin: 14px 0 4px; font-size: 13px; }
+.ec-fec { color: var(--good); font-weight: 600; }
+.ec-table { margin-bottom: 4px; }
+.ec-table td:first-child { color: var(--text); }
+.ec-table tr.warn td { color: var(--degraded); }
+@media (max-width: 720px) {
+  .ec-table { display: block; overflow-x: auto; white-space: nowrap; }
+}
+.ec-table th:nth-child(2), .ec-table td:nth-child(2) { text-align: left; }

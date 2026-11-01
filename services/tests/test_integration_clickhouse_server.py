@@ -14,10 +14,12 @@ Each test creates (and drops) its own database, so it is safe on a shared lab se
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import secrets
 import time
 from collections.abc import Iterator
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -196,3 +198,54 @@ def test_flows_paths_and_rollup_on_the_server(flows_db: str, tmp_path: Path) -> 
     assert result["status"] == "warn"
     assert {f["code"] for f in result["findings"]} == {"forward_dscp_mismatch"}, "return flow kept EF"
     assert result["forward"][0]["out_if_name"] == "wan0" and result["return"][0]["in_transport"] == "INET"
+
+
+
+# -- Phase 2: Orchestrator tunnel_stats ---------------------------------------------
+
+@pytest.fixture
+def orch_db() -> Iterator[str]:
+    name = f"buffmon_it_{secrets.token_hex(4)}"
+    for stmt in _statements("003_tunnel_stats.sql"):
+        _admin(stmt.replace("buffmon.", f"{name}.").replace("DATABASE IF NOT EXISTS buffmon", f"DATABASE {name}"))
+    try:
+        yield name
+    finally:
+        _admin("DROP DATABASE IF EXISTS {db:Identifier}", db=name)
+
+
+def test_tunnel_summary_query_on_the_server(orch_db: str) -> None:
+    from buffmon.orch.mapping import bucket_context, load_mapping, normalize
+    from buffmon.orch.poller import OrchTransport, rows_token
+    from buffmon.tunnels import query_tunnels
+
+    mapping = load_mapping(Path(__file__).resolve().parents[2] / "deploy" / "orchestrator" / "mapping.10.x.yaml")
+    fixture = Path(__file__).resolve().parent / "fixtures" / "orch" / "aggregate_tunnel_10x.json"
+    response = {k: v for k, v in json.loads(fixture.read_text()).items() if not k.startswith("_")}
+    now_s = int(time.time()) // 60 * 60
+    rows: list[dict[str, Any]] = []
+    for start in (now_s - 180, now_s - 120):  # two minutes of the same tunnels
+        ctx = {"appliance_id": "1.NE", "hostname": "ec-a-01", "site": "A", **bucket_context(start, start + 60)}
+        got, problems = normalize("tunnel_stats", mapping.collectors["tunnel_stats"], response,
+                                  datetime.now(tz=UTC), "10.0", ctx)
+        assert problems == []
+        rows += got
+
+    async def go() -> list[dict[str, Any]]:
+        assert URL
+        sink = OrchTransport(URL, orch_db, USER, PASSWORD, timeout_s=30)
+        try:
+            await sink.insert_rows("tunnel_stats", rows, rows_token("tunnel_stats", rows))
+            await sink.insert_rows("tunnel_stats", rows, rows_token("tunnel_stats", rows))  # re-poll
+            return await query_tunnels(sink, (now_s - 600) * 1000)
+        finally:
+            await sink.aclose()
+
+    tunnels = {t["tunnel_id"]: t for t in asyncio.run(go())}
+    assert set(tunnels) == {"bondedTunnel_17", "tunnel_47", "tunnel_27"}
+    t47 = tunnels["tunnel_47"]
+    assert t47["minutes"] == 2, "re-poll replaced, not duplicated"
+    assert (t47["loss_pre_pkts"], t47["loss_post_pkts"], t47["fec_recovered_pkts"]) == (80, 4, 76)
+    assert (t47["tunnel_kind"], t47["transport"], t47["peer"]) == ("underlay", "INET1", "ec-b-01")
+    assert t47["latency_ms"] == 42.0 and t47["latency_max_ms"] == 42.0
+    assert tunnels["bondedTunnel_17"]["overlay"] == "DEFAULT"

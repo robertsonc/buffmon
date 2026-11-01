@@ -1,0 +1,56 @@
+{
+  "swagger": "2.0",
+  "info": {"title": "SYNTHETIC test API (not Orchestrator)", "version": "1.0"},
+  "parameters": {
+    "WindowParam": {"name": "window", "in": "query", "type": "integer", "format": "int32", "description": "seconds"}
+  },
+  "paths": {
+    "/synthetic/appliances": {
+      "get": {
+        "operationId": "listAppliances", "tags": ["inventory"], "summary": "List appliances",
+        "responses": {"200": {"description": "ok", "schema": {"type": "array", "items": {"$ref": "#/definitions/Appliance"}}}}
+      }
+    },
+    "/synthetic/appliances/{applianceId}/tunnels": {
+      "parameters": [{"name": "applianceId", "in": "path", "required": true, "type": "string"}],
+      "get": {
+        "operationId": "getTunnelStats", "tags": ["tunnels"], "summary": "Per-tunnel stats\nsecond line ignored",
+        "parameters": [{"$ref": "#/parameters/WindowParam"}],
+        "responses": {"200": {"description": "ok", "schema": {"$ref": "#/definitions/TunnelPage"}}}
+      },
+      "post": {"operationId": "createTunnel", "responses": {"201": {"description": "created"}}}
+    },
+    "/synthetic/tree": {
+      "get": {"operationId": "getTree", "summary": "circular structure",
+              "responses": {"200": {"description": "ok", "schema": {"$ref": "#/definitions/Node"}}}}
+    },
+    "/synthetic/broken": {
+      "get": {"operationId": "brokenRefs", "summary": "health of broken refs",
+              "responses": {"200": {"description": "ok", "schema": {"type": "object", "properties": {
+                "missing": {"$ref": "#/definitions/DoesNotExist"},
+                "external": {"$ref": "other.json#/definitions/X"}}}}}}
+    },
+    "/synthetic/noschema/health": {
+      "get": {"operationId": "noSchema", "responses": {"200": {"description": "ok, but no schema"}}}
+    },
+    "/synthetic/legacy/alarms": {
+      "get": {"operationId": "legacyAlarms", "tags": ["alarms"],
+              "responses": {"200": {"description": "ok", "schema": {"type": "array", "items": {"type": "object"}}}}}
+    },
+    "x-vendor-extension": "not a path item"
+  },
+  "definitions": {
+    "Appliance": {"type": "object", "properties": {
+      "id": {"type": "string"}, "name": {"type": "string"}, "siteName": {"type": "string"}}},
+    "TunnelBase": {"type": "object", "properties": {"tunnelId": {"type": "string"}, "label": {"type": "string"}}},
+    "Tunnel": {"allOf": [{"$ref": "#/definitions/TunnelBase"}, {"type": "object", "properties": {
+      "stats": {"type": "object", "properties": {
+        "lossPre": {"type": "number", "format": "float", "description": "fraction 0..1"},
+        "latencyUs": {"type": "integer", "format": "int64"}}}}}]},
+    "TunnelPage": {"type": "object", "properties": {
+      "tunnels": {"type": "object", "additionalProperties": {"$ref": "#/definitions/Tunnel"}},
+      "ts": {"type": "integer", "format": "int64"}}},
+    "Node": {"type": "object", "properties": {
+      "name": {"type": "string"}, "children": {"type": "array", "items": {"$ref": "#/definitions/Node"}}}}
+  }
+}

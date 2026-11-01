@@ -257,3 +257,24 @@ def test_shipped_sites_example_is_valid() -> None:
 
     cfg = load_sites(Path(__file__).resolve().parents[2] / "deploy" / "sites.example.yaml")
     assert cfg.probe_ports == [862] and len(cfg.exporters) == 2
+
+
+def test_tunnels_api_shapes_orchestrator_rows(settings: Settings) -> None:
+    transport = FakeTransport()
+    transport.select_rows = [{
+        "appliance": "ec-a-01", "site": "A", "tunnel_id": "tunnel_47", "tunnel_name": "to_ec-b-01_INET1-AZR_INET",
+        "tunnel_kind": "underlay", "overlay": "", "transport": "INET1", "peer": "ec-b-01",
+        "rx_pkts": "1300", "ohead_rx_pkts": "25", "loss_pre_pkts": "40", "loss_post_pkts": "2",
+        "ooo_pre_pkts": "5", "ooo_post_pkts": "0", "loss_pre_pct_max": 3.0, "loss_post_pct_max": 0.15,
+        "latency_ms": 42.0, "latency_max_ms": 47.0, "jitter_ms": 2.1, "mos_min": 4.37,
+        "last_ms": "1793556000000", "minutes": "15",
+    }]
+    with TestClient(create_app(settings, transport=transport)) as client:
+        body = client.get("/v1/tunnels?minutes=15&appliance=ec-a-01").json()
+        t = body["tunnels"][0]
+        assert (t["loss_pre_pkts"], t["loss_post_pkts"], t["fec_recovered_pkts"]) == (40, 2, 38)
+        assert t["rx_pkts"] == 1300 and t["mos_min"] == 4.37
+        sql, params = transport.selects[-1]
+        assert "tunnel_stats FINAL" in sql and params["appliance"] == "ec-a-01"
+        assert client.get("/v1/tunnels?appliance=bad name").status_code == 400
+        assert client.get("/v1/tunnels?minutes=0").status_code == 400

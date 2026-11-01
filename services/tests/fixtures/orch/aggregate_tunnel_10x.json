@@ -1,0 +1,18 @@
+{
+  "_comment": "Shape of GET /stats/aggregate/tunnel?groupByNE=false as returned live by Orchestrator 10.0.0.40724 (2026-11-01): field names are real, values and names are synthetic. Only the fields the 10.x mapping reads are kept.",
+  "bondedTunnel_17": {"TUNNEL": "bondedTunnel_17", "alias": "to_ec-b-01_DEFAULT", "overlayid": "4", "isPassThrough": false,
+    "MIN_TIMESTAMP": 1793556000, "MAX_TIMESTAMP": 1793556000, "SUM_WRX_PKTS": 1200, "SUM_OHEAD_WRX_PKTS": 7,
+    "SUM_PRE_LOSS": 0, "SUM_POST_LOSS": 0, "SUM_PRE_POC": 0, "SUM_POST_POC": 0, "MAX_PRE_PCT_LOSS": 0, "MAX_POST_PCT_LOSS": 0,
+    "MAX_PRE_PCT_POC": 0, "MAX_POST_PCT_POC": 0, "AVG_LATENCY_AVG": 41, "AVG_JITTER": 0.0, "mos": 438,
+    "avg_mos_prefec": 4889642559722716160, "SUM_WTX_BYTES": 90000, "SUM_WRX_BYTES": 110000},
+  "tunnel_47": {"TUNNEL": "tunnel_47", "alias": "to_ec-b-01_INET1-AZR_INET", "overlayid": "0", "isPassThrough": false,
+    "MIN_TIMESTAMP": 1793556000, "MAX_TIMESTAMP": 1793556000, "SUM_WRX_PKTS": 1300, "SUM_OHEAD_WRX_PKTS": 25,
+    "SUM_PRE_LOSS": 40, "SUM_POST_LOSS": 2, "SUM_PRE_POC": 5, "SUM_POST_POC": 0, "MAX_PRE_PCT_LOSS": 3, "MAX_POST_PCT_LOSS": 0.15,
+    "MAX_PRE_PCT_POC": 0.4, "MAX_POST_PCT_POC": 0, "AVG_LATENCY_AVG": 42, "AVG_JITTER": 2.1, "mos": 437,
+    "SUM_WTX_BYTES": 95000, "SUM_WRX_BYTES": 120000},
+  "tunnel_27": {"TUNNEL": "tunnel_27", "alias": "to_ec-c-02_AZR_INET-AZR_INET", "overlayid": "0", "isPassThrough": false,
+    "MIN_TIMESTAMP": 1793556000, "MAX_TIMESTAMP": 1793556000, "SUM_WRX_PKTS": 0, "SUM_OHEAD_WRX_PKTS": 25,
+    "SUM_PRE_LOSS": 0, "SUM_POST_LOSS": 0, "SUM_PRE_POC": 0, "SUM_POST_POC": 0, "MAX_PRE_PCT_LOSS": 0, "MAX_POST_PCT_LOSS": 0,
+    "MAX_PRE_PCT_POC": 0, "MAX_POST_PCT_POC": 0, "AVG_LATENCY_AVG": 22, "AVG_JITTER": 0.0, "mos": 439,
+    "SUM_WTX_BYTES": 0, "SUM_WRX_BYTES": 3000}
+}

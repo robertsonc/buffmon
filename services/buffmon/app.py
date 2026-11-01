@@ -29,6 +29,7 @@ from .live import WINDOWS_S, LiveHub
 from .models import NAME_PATTERN, IngestBatch, ProbeRecord
 from .store import HISTORY_RANGES, ClickHouseError, HttpTransport, SampleWriter, Transport, query_history, record_to_row
 from .thresholds import ThresholdsFile
+from .tunnels import query_tunnels
 from .uiauth import COOKIE_NAME, UiAuth
 
 log = logging.getLogger(__name__)
@@ -377,6 +378,25 @@ def create_app(
         if not 1 <= minutes <= 60:
             return JSONResponse({"error": "minutes must be 1-60"}, status_code=400)
         return await _paths(minutes, f"{probe_id}/{session}")
+
+    # -- EdgeConnect tunnel health (Orchestrator, via buffmon-orch-poll) -----
+    @app.get("/v1/tunnels")
+    async def tunnels(request: Request, minutes: int = 15, appliance: str = "") -> JSONResponse:
+        if not ui_ok(request):
+            return unauthorized()
+        if not 1 <= minutes <= 1440:
+            return JSONResponse({"error": "minutes must be 1-1440"}, status_code=400)
+        if appliance and not _NAME_RE.match(appliance):
+            return JSONResponse({"error": "invalid appliance"}, status_code=400)
+        if state.transport is None:
+            return JSONResponse({"error": "tunnels unavailable: ClickHouse is disabled"}, status_code=503)
+        now_ms = int(state.clock() * 1000)
+        try:
+            rows = await query_tunnels(state.transport, now_ms - minutes * 60_000, appliance)
+        except ClickHouseError as exc:
+            log.warning("tunnel query failed: %s", exc)
+            return JSONResponse({"error": "tunnels unavailable: storage query failed"}, status_code=503)
+        return JSONResponse({"server_ms": now_ms, "minutes": minutes, "tunnels": rows})
 
     # -- live WebSocket -------------------------------------------------------
     @app.websocket("/v1/live")

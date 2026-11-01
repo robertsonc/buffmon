@@ -1,0 +1,81 @@
+# SYNTHETIC test API (not Orchestrator) — the "next release" of swagger2_synthetic.json
+openapi: 3.0.3
+info: {title: "SYNTHETIC test API (not Orchestrator)", version: "2.0"}
+components:
+  schemas:
+    Appliance:
+      type: object
+      properties:
+        id: {type: string}
+        name: {type: string}
+        siteName: {type: string}
+        model: {type: string}
+    TunnelBase:
+      type: object
+      properties:
+        tunnelId: {type: string}
+        label: {type: string}
+    Tunnel:
+      allOf:
+        - $ref: '#/components/schemas/TunnelBase'
+        - type: object
+          properties:
+            stats:
+              type: object
+              properties:
+                lossPre: {type: number, format: double}
+                lossPost: {type: number, format: double}
+                latencyUs: {type: integer, format: int64}
+    Event:
+      oneOf:
+        - type: object
+          properties: {alarmId: {type: string}, severity: {type: string, enum: [critical, major, minor]}}
+        - type: object
+          properties: {alarmId: {type: string}, clearedAt: {type: integer}}
+paths:
+  /synthetic/appliances:
+    get:
+      operationId: listAppliances
+      tags: [inventory]
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: {type: array, items: {$ref: '#/components/schemas/Appliance'}}
+  /synthetic/appliances/{syntheticApplianceKey}/tunnels:
+    get:
+      operationId: getTunnelStats
+      tags: [tunnels]
+      parameters:
+        - {name: syntheticApplianceKey, in: path, required: true, schema: {type: string}}
+        - {name: window, in: query, required: true, schema: {type: integer}}
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  tunnels: {type: object, additionalProperties: {$ref: '#/components/schemas/Tunnel'}}
+                  ts: {type: string, format: date-time}
+  /synthetic/alarms:
+    get:
+      operationId: listAlarms
+      tags: [alarms]
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema: {type: array, items: {$ref: '#/components/schemas/Event'}}
+  /synthetic/tree:
+    get:
+      operationId: getTree
+      responses:
+        default:
+          description: ok
+          content:
+            application/json:
+              schema: {type: object, properties: {name: {type: string}}}

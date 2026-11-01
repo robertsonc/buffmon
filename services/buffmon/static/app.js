@@ -21,7 +21,7 @@
   var LIVE_MS = 15 * 60 * 1000;
 
   var S = {
-    sessions: {}, list: [], series: {}, thresholds: null, retentionMs: 900000, paths: {}, pathsUnavailable: null,
+    sessions: {}, list: [], series: {}, thresholds: null, retentionMs: 900000, paths: {}, pathsUnavailable: null, tunnels: [],
     filterStatus: null, search: "", cls: "", kind: "", lastMsgAt: 0, retry: 0,
     open: null, histRange: "1h", histTimer: null, cards: {}, siteEls: {}, ever: false,
   };
@@ -437,10 +437,29 @@
     }
   }
 
+  function renderPathTunnels(s) {
+    var box = $("d-tunnels");
+    box.textContent = "";
+    var p = s.kind === "stamp" ? S.paths[s.key] : null;
+    var apps = {};
+    if (p) p.forward.concat(p["return"]).forEach(function (h) { apps[h.appliance] = true; });
+    var rows = (S.tunnels || []).filter(function (t) { return apps[t.appliance]; });
+    if (!rows.length) {
+      box.appendChild(el("p", "muted", p && Object.keys(apps).length
+        ? "No Orchestrator tunnel data for " + Object.keys(apps).join(", ") + " (is buffmon-orch-poll running?)."
+        : "Shown once the probe's path through an EdgeConnect is known from the flow export."));
+      return;
+    }
+    box.appendChild(el("p", "muted", "Tunnel loss before FEC is what the underlay did; after FEC is what the " +
+      "overlay delivered. Compare with this probe's own loss above."));
+    box.appendChild(tunnelTable(rows));
+  }
+
   function refreshDrawer(first) {
     var s = S.sessions[S.open];
     if (!s) return;
     renderPath(s);
+    renderPathTunnels(s);
     $("d-title").textContent = s.session;
     $("d-sub").textContent = s.site + " · " + (KIND_LABEL[s.kind] || s.kind) + " · " + s.app_class + " · " + dscpName(s.dscp);
     var pill = $("d-pill");
@@ -511,6 +530,70 @@
       b.setAttribute("aria-selected", String(b.dataset.range === S.histRange));
     });
   }
+
+  // EdgeConnect tunnel health from Orchestrator (buffmon-orch-poll), polled.
+  function fmtNum(v, digits) { return v == null ? "–" : (Math.round(v * Math.pow(10, digits)) / Math.pow(10, digits)).toString(); }
+  function lossCell(pkts, pctMax) {
+    if (pkts == null) return "–";
+    return pkts + " pkts" + (pkts && pctMax != null ? " (max " + fmtNum(pctMax, 2) + "%/min)" : "");
+  }
+  function tunnelTable(rows) {
+    var tbl = el("table", "win ec-table");
+    var head = el("tr");
+    ["Tunnel", "Type", "Latency avg / max", "Jitter", "Loss before FEC", "Loss after FEC", "MOS min"].forEach(function (h) {
+      head.appendChild(el("th", null, h));
+    });
+    var thead = el("thead"); thead.appendChild(head); tbl.appendChild(thead);
+    rows.forEach(function (t) {
+      var tr = el("tr", (t.loss_post_pkts || 0) > 0 ? "warn" : null);
+      tr.title = t.tunnel_name + " (" + t.tunnel_id + ")";
+      tr.appendChild(el("td", null, "→ " + (t.peer || t.tunnel_id)));
+      tr.appendChild(el("td", null, t.tunnel_kind === "overlay" ? "overlay " + (t.overlay || "") :
+        t.tunnel_kind === "underlay" ? "underlay " + (t.transport || "") : (t.tunnel_kind || "")));
+      tr.appendChild(el("td", null, fmtNum(t.latency_ms, 1) + " / " + fmtNum(t.latency_max_ms, 0) + " ms"));
+      tr.appendChild(el("td", null, fmtNum(t.jitter_ms, 1) + " ms"));
+      tr.appendChild(el("td", null, lossCell(t.loss_pre_pkts, t.loss_pre_pct_max)));
+      tr.appendChild(el("td", null, lossCell(t.loss_post_pkts, t.loss_post_pct_max)));
+      tr.appendChild(el("td", null, fmtNum(t.mos_min, 2)));
+      tbl.appendChild(tr);
+    });
+    return tbl;
+  }
+  function renderTunnels() {
+    var box = $("ec-body");
+    var rows = S.tunnels || [];
+    $("ec").hidden = rows.length === 0;
+    if (!rows.length) return;
+    box.textContent = "";
+    var byApp = {};
+    rows.forEach(function (t) { (byApp[t.appliance] = byApp[t.appliance] || []).push(t); });
+    var apps = Object.keys(byApp).sort();
+    var pre = 0, post = 0;
+    rows.forEach(function (t) { pre += t.loss_pre_pkts || 0; post += t.loss_post_pkts || 0; });
+    $("ec-counts").textContent = apps.length + " appliances · " + rows.length + " tunnels · loss " + pre +
+      " pkts before FEC, " + post + " after";
+    apps.forEach(function (a) {
+      var list = byApp[a];
+      var head = el("div", "ec-app");
+      head.appendChild(el("b", null, a));
+      head.appendChild(el("span", "muted", " · " + (list[0].site || "no site") + " · " + list.length + " tunnels"));
+      var rec = list.reduce(function (n, t) { return n + (t.fec_recovered_pkts || 0); }, 0);
+      if (rec) head.appendChild(el("span", "ec-fec", " · FEC recovered " + rec + " pkts"));
+      box.appendChild(head);
+      box.appendChild(tunnelTable(list));
+    });
+  }
+  function loadTunnels() {
+    fetch("/v1/tunnels?minutes=15", { credentials: "same-origin", headers: { accept: "application/json" } })
+      .then(function (r) {
+        if (r.status === 401) { location.href = "/login"; throw new Error("login required"); }
+        return r.json().then(function (b) { if (!r.ok) throw new Error(b.error || ("HTTP " + r.status)); return b; });
+      })
+      .then(function (b) { S.tunnels = b.tunnels || []; renderTunnels(); if (S.open) refreshDrawer(false); })
+      .catch(function () { S.tunnels = []; renderTunnels(); });
+  }
+  setInterval(loadTunnels, 60000);
+  setTimeout(loadTunnels, 1500);
 
   // Probe paths from the EdgeConnect flow export: near-real-time, so poll, not push.
   function loadPaths() {
