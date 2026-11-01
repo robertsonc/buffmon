@@ -37,7 +37,7 @@ pps = 1
 name = "dc1-voice"
 target = "10.10.0.20:862"
 source = "0.0.0.0:40001"
-pps = 10                     # 300 packets per 30 s window → loss resolvable to ~1%
+pps = 20                     # 600 packets per 30 s → can show loss < 1% (Wilson bound 0.64%)
 dscp = 46                    # EF
 app_class = "voice"
 
@@ -45,7 +45,7 @@ app_class = "voice"
 name = "dc1-video"
 target = "10.10.0.20:862"
 source = "0.0.0.0:40002"
-pps = 10
+pps = 20
 dscp = 34                    # AF41
 app_class = "video"
 

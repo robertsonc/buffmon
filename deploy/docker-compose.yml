@@ -1,0 +1,84 @@
+# buffmon Phase 1: ClickHouse + ingest/dashboard.
+#
+#   cd deploy
+#   cp .env.example .env            # then fill in the secrets (see comments there)
+#   mkdir -p secrets && ../services/.venv/bin/buffmon-mint-token probe \
+#       --probe-id sjc-br01-p1 --tokens-file secrets/probe-tokens.json
+#   docker compose up -d --build
+#
+# The dashboard listens on 127.0.0.1:8080 only. Put TLS (and ideally an
+# identity-aware proxy) in front before exposing it beyond the host.
+name: buffmon
+
+services:
+  clickhouse:
+    image: clickhouse/clickhouse-server:25.8.33.6
+    restart: unless-stopped
+    environment:
+      CLICKHOUSE_DB: buffmon
+      CLICKHOUSE_USER: buffmon
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?set CLICKHOUSE_PASSWORD in deploy/.env}
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "0"
+    volumes:
+      - ch-data:/var/lib/clickhouse
+      - ./clickhouse/001_schema.sql:/docker-entrypoint-initdb.d/001_schema.sql:ro
+    ports:
+      - "127.0.0.1:8123:8123"     # HTTP interface, host-local only (ops/debug)
+    ulimits:
+      nofile: { soft: 262144, hard: 262144 }
+    # Default capabilities: the image entrypoint starts as root, fixes data-dir
+    # ownership, then drops to the clickhouse user. Not privileged.
+    healthcheck:
+      # $$ defers expansion to the container, so the password is not baked into
+      # the compose-rendered healthcheck definition.
+      test: ["CMD-SHELL", "clickhouse-client --user buffmon --password \"$$CLICKHOUSE_PASSWORD\" --query 'SELECT 1'"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  ingest:
+    build: ../services
+    image: buffmon-ingest:0.1.0
+    restart: unless-stopped
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    environment:
+      BUFFMON_CLICKHOUSE_URL: http://clickhouse:8123
+      BUFFMON_CLICKHOUSE_USER: buffmon
+      BUFFMON_CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?set CLICKHOUSE_PASSWORD in deploy/.env}
+      BUFFMON_PROBE_TOKENS_FILE: /run/secrets/probe_tokens
+      BUFFMON_UI_TOKEN_SHA256: ${BUFFMON_UI_TOKEN_SHA256:?run buffmon-mint-token ui and set it in deploy/.env}
+      BUFFMON_SESSION_SECRET: ${BUFFMON_SESSION_SECRET:?run buffmon-mint-token ui and set it in deploy/.env}
+      # Plain HTTP on localhost for the lab. Set to "true" once TLS terminates in front.
+      BUFFMON_COOKIE_SECURE: ${BUFFMON_COOKIE_SECURE:-false}
+    secrets:
+      - probe_tokens
+    ports:
+      - "127.0.0.1:8080:8080"
+    read_only: true
+    tmpfs: ["/tmp"]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+
+  # --------------------------------------------------------------------------
+  # Probes and reflectors are deliberately NOT in this file: site probes run on
+  # the branch host under systemd (deploy/systemd/), reflectors in the DC/cloud.
+  # For a containerised lab, use probe/Dockerfile (never privileged: true):
+  #  - reflector: cap_drop [ALL], listen on 8620 and publish "862:8620/udp"
+  #    (unprivileged port, so no capability at all);
+  #  - probe: cap_drop [ALL] + cap_add [NET_RAW]. The image grants NET_RAW via a
+  #    file capability, which no-new-privileges disables; without it the probe
+  #    falls back to unprivileged datagram ICMP, so that option is a trade-off.
+  # Not built or run here yet (no Docker in the build environment).
+  # --------------------------------------------------------------------------
+
+volumes:
+  ch-data:
+
+secrets:
+  probe_tokens:
+    # JSON {"probe_id": "<sha256 of token>"}. Compose bind-mounts this file, so
+    # it must be readable by uid 10001 inside the container:
+    #   chmod 0640 secrets/probe-tokens.json && sudo chgrp 10001 secrets/probe-tokens.json
+    file: ./secrets/probe-tokens.json

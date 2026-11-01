@@ -32,7 +32,7 @@ after Phase 1 is design only.
 | # | Decision | Why |
 |---|---|---|
 | D1 | **Probes must follow the user's path.** Every probe session has an app class, a DSCP mark and a stable source port. In Phase 2 the probe's own IPFIX record is used to confirm which overlay and transport it actually took. | EdgeConnect steers by business-intent overlay (app/DSCP/ACL). A probe on the wrong overlay measures a path nobody uses. |
-| D2 | **Loss is reported with its sample count and a 95% upper bound** (Wilson score interval). Real-time loss uses 10 s and 30 s rolling windows. | Zero losses in *n* packets bound loss at ≈3/*n*. Claiming <1% takes about 300 packets: 30 s at 10 pps. |
+| D2 | **Loss is reported with its sample count and a 95% upper bound** (Wilson score interval). Real-time loss uses 10 s and 30 s rolling windows. | With zero losses in *n* packets the Wilson 95% bound is ≈3.84/*n* (the rule of three gives ≈3/*n*). Showing <1% takes about 380 packets: voice/video sessions run at 20 pps (600 per 30 s, bound ≈0.64%). At 10 pps the bound never drops below 1.26% and the status stays "insufficient samples". |
 | D3 | **STAMP (RFC 8762), stateful reflector, is the quality probe.** ICMP is for reachability and topology only. TCP connect is for service reachability and handshake time. | ICMP is rate-limited and deprioritised by control-plane policing (SRX/MX/CX, cloud). Per-hop ICMP numbers are artefacts. |
 | D4 | **Direction matters.** The stateful reflector's counter splits loss into forward and return. IPDV (RFC 3393/5481) is computed per direction; clock offset cancels out. One-way delay is reported only when both ends say they are synchronised, together with the combined error bound. | SD-WAN paths are frequently asymmetric. "Which direction" halves the search. |
 | D5 | **The reflector reflects the DSCP and the packet size** it received. | So the return path is classified like the forward path, and there is no amplification. |
@@ -169,8 +169,18 @@ Per session, over rolling windows:
   RTT samples are kept as an array so percentiles over any window are exact.
   30-day TTL.
 - `probe_minute`: `AggregatingMergeTree` rollup via materialised view, 400-day
-  TTL. Ingest drops duplicate records (in-memory LRU of recent keys) before
-  insert, so the rollup does not see retries.
+  TTL.
+- Duplicates are stopped at three points. (1) Ingest drops records whose key it
+  has seen in the last 15 minutes (in memory), which catches probe retries.
+  (2) Each ClickHouse insert carries an `insert_deduplication_token` with
+  `deduplicate_blocks_in_dependent_materialized_views = 1`, so an ingest → ClickHouse
+  retry is applied once to both tables. (3) `probe_second` is a
+  `ReplacingMergeTree`, so any duplicate that still lands collapses on merge.
+  Known gap: if the ingest service restarts and a probe then re-sends a batch,
+  (1) has forgotten it and (2) sees a new block, so `probe_minute` counts it
+  twice; `probe_second` is still exact after merge. Bounded by the probe's
+  retry window; closing it needs a persistent dedup key store (Phase 2, with
+  the bus).
 
 ## 9. Security
 

@@ -1,0 +1,52 @@
+# Per-application-class thresholds for the live status (docs/DESIGN.md §6).
+#
+# These are STARTING POINTS. Tune them per customer and per path.
+#
+#   value <= good          -> good
+#   good < value <= bad    -> degraded
+#   value > bad            -> bad
+#
+# Loss is evaluated on the 30 s window; RTT p95 and jitter on the 10 s window.
+# A loss point estimate within "good" whose 95% upper bound is not yet within
+# "good" reports "insufficient-samples" instead of "good".
+#
+# Sources for the "good" limits on voice/video: Microsoft's published Teams
+# network targets from client to the Microsoft edge (RTT < 100 ms, loss < 1%
+# in any 15 s, jitter < 30 ms in any 15 s). Re-check the current Microsoft
+# documentation before quoting them. The "bad" limits use ITU-T G.114's 150 ms
+# one-way delay as the outer bound (~300 ms RTT) and are judgement calls.
+#
+# jitter_ms: null means jitter is shown but not used for status.
+
+version: 1
+
+windows:
+  loss_s: 30
+  latency_s: 10
+
+default_class: bulk
+
+classes:
+  voice:
+    description: Real-time voice (Teams/Zoom/Webex audio, SIP/RTP). Typically EF / DSCP 46.
+    rtt_p95_ms: { good: 100, bad: 300 }
+    loss_pct: { good: 1.0, bad: 3.0 }
+    jitter_ms: { good: 30, bad: 50 }
+
+  video:
+    description: Real-time video and screen share. Typically AF41 / DSCP 34.
+    rtt_p95_ms: { good: 100, bad: 300 }
+    loss_pct: { good: 1.0, bad: 3.0 }
+    jitter_ms: { good: 30, bad: 50 }
+
+  interactive:
+    description: Transactional SaaS, web apps, VDI. Latency-sensitive, loss-tolerant via TCP.
+    rtt_p95_ms: { good: 150, bad: 400 }
+    loss_pct: { good: 1.0, bad: 3.0 }
+    jitter_ms: null
+
+  bulk:
+    description: Default / best effort / file transfer.
+    rtt_p95_ms: { good: 300, bad: 800 }
+    loss_pct: { good: 2.0, bad: 5.0 }
+    jitter_ms: null
