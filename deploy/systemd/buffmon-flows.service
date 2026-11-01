@@ -1,0 +1,57 @@
+[Unit]
+Description=buffmon flow collector (goflow2 -> exporter allowlist + enrichment -> ClickHouse)
+Documentation=https://github.com/robertsonc/buffmon/blob/main/deploy/goflow2/README.md
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+# buffmon-flows starts goflow2 itself (fixed argument list, no shell) and reads
+# its JSON on stdout. If goflow2 exits, buffmon-flows exits and systemd restarts both.
+ExecStart=/opt/buffmon/venv/bin/buffmon-flows
+Restart=on-failure
+RestartSec=5s
+
+Environment=BUFFMON_FLOWS_GOFLOW2_BIN=/usr/local/bin/goflow2
+Environment=BUFFMON_FLOWS_GOFLOW2_LISTEN=netflow://0.0.0.0:2055
+Environment=BUFFMON_FLOWS_SITES_FILE=/etc/buffmon/sites.yaml
+Environment=BUFFMON_CLICKHOUSE_URL=http://127.0.0.1:8123
+Environment=BUFFMON_CLICKHOUSE_USER=buffmon
+# BUFFMON_CLICKHOUSE_PASSWORD lives here: root-owned, mode 0600. systemd reads
+# it before dropping privileges; the service user never sees the file.
+EnvironmentFile=/etc/buffmon/flows.env
+
+# --- Privileges: none. UDP 2055 is unprivileged. --------------------------------
+DynamicUser=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=yes
+
+# --- Hardening -----------------------------------------------------------------
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectHostname=yes
+ProtectClock=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+UMask=0077
+
+MemoryMax=1G
+TasksMax=256
+
+[Install]
+WantedBy=multi-user.target

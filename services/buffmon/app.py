@@ -24,6 +24,7 @@ from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoin
 from .auth import ProbeTokens, bearer_token
 from .config import Settings
 from .dedup import RecentKeys
+from .flows.path import analyse, query_paths
 from .live import WINDOWS_S, LiveHub
 from .models import NAME_PATTERN, IngestBatch, ProbeRecord
 from .store import HISTORY_RANGES, ClickHouseError, HttpTransport, SampleWriter, Transport, query_history, record_to_row
@@ -338,6 +339,44 @@ def create_app(
             log.warning("history query failed: %s", exc)
             return JSONResponse({"error": "history unavailable: storage query failed"}, status_code=503)
         return JSONResponse(data)
+
+    # -- probe path validation (EdgeConnect flow export) ---------------------
+    async def _paths(minutes: int, only: str | None) -> JSONResponse:
+        if state.transport is None:
+            return JSONResponse({"error": "paths unavailable: ClickHouse is disabled"}, status_code=503)
+        now_ms = int(state.clock() * 1000)
+        try:
+            rows = await query_paths(state.transport, now_ms - minutes * 60_000)
+        except ClickHouseError as exc:
+            log.warning("path query failed: %s", exc)
+            return JSONResponse({"error": "paths unavailable: storage query failed"}, status_code=503)
+        out: dict[str, Any] = {}
+        for key, st in list(state.hub.sessions.items()):
+            if st.kind != "stamp" or (only is not None and key != only):
+                continue
+            out[key] = analyse(st.src, st.dst, st.dscp, st.app_class, rows, minutes)
+        if only is not None and only not in out:
+            return JSONResponse({"error": "no live STAMP session with that name"}, status_code=404)
+        return JSONResponse({"server_ms": now_ms, "minutes": minutes, "paths": out})
+
+    @app.get("/v1/paths")
+    async def paths(request: Request, minutes: int = 5) -> JSONResponse:
+        """Path summary for every live STAMP session (the dashboard polls this)."""
+        if not ui_ok(request):
+            return unauthorized()
+        if not 1 <= minutes <= 60:
+            return JSONResponse({"error": "minutes must be 1-60"}, status_code=400)
+        return await _paths(minutes, None)
+
+    @app.get("/v1/sessions/{probe_id}/{session}/path")
+    async def session_path(request: Request, probe_id: str, session: str, minutes: int = 10) -> JSONResponse:
+        if not ui_ok(request):
+            return unauthorized()
+        if not _NAME_RE.match(probe_id) or not _NAME_RE.match(session):
+            return JSONResponse({"error": "invalid probe_id or session"}, status_code=400)
+        if not 1 <= minutes <= 60:
+            return JSONResponse({"error": "minutes must be 1-60"}, status_code=400)
+        return await _paths(minutes, f"{probe_id}/{session}")
 
     # -- live WebSocket -------------------------------------------------------
     @app.websocket("/v1/live")

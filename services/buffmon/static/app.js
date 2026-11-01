@@ -21,12 +21,16 @@
   var LIVE_MS = 15 * 60 * 1000;
 
   var S = {
-    sessions: {}, list: [], series: {}, thresholds: null, retentionMs: 900000,
+    sessions: {}, list: [], series: {}, thresholds: null, retentionMs: 900000, paths: {}, pathsUnavailable: null,
     filterStatus: null, search: "", cls: "", kind: "", lastMsgAt: 0, retry: 0,
     open: null, histRange: "1h", histTimer: null, cards: {}, siteEls: {}, ever: false,
   };
 
   // ---------------------------------------------------------------- helpers
+  var PATH_LABEL = {
+    forward_dscp_mismatch: "DSCP re-marked → (probe may be on the wrong overlay)",
+    return_dscp_mismatch: "DSCP re-marked on the return path"
+  };
   function $(id) { return document.getElementById(id); }
   function el(tag, cls, text) {
     var e = document.createElement(tag);
@@ -270,13 +274,14 @@
     var foot = el("div", "card-foot");
     var footText = el("span");
     var pathchg = el("span", "pathchg");
+    var pathinfo = el("span", "pathinfo");
     var reason = el("span", "reason");
-    foot.appendChild(footText); foot.appendChild(pathchg); foot.appendChild(reason);
+    foot.appendChild(footText); foot.appendChild(pathchg); foot.appendChild(pathinfo); foot.appendChild(reason);
     c.appendChild(head); c.appendChild(metrics); c.appendChild(canvas); c.appendChild(foot);
     c.addEventListener("click", function () { openDrawer(c.dataset.key); });
     c.addEventListener("keydown", function (e) { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); openDrawer(c.dataset.key); } });
     return { root: c, title: t, meta: meta, badge: badge, pill: pill, metrics: mEls, canvas: canvas,
-      footText: footText, pathchg: pathchg, reason: reason };
+      footText: footText, pathchg: pathchg, pathinfo: pathinfo, reason: reason };
   }
 
   function updateCard(card, s, xMax) {
@@ -307,6 +312,17 @@
         pc.hops_from + "→" + pc.hops_to + " hops, " + ago((xMax - pc.ts_ms) / 1000);
     } else {
       card.pathchg.textContent = "";
+    }
+    var path = s.kind === "stamp" ? S.paths[s.key] : null;
+    if (path) {
+      card.pathinfo.className = "pathinfo" + (path.status === "warn" ? " warn" : "");
+      var warnF = path.findings.filter(function (f) { return f.severity === "warn"; })[0];
+      card.pathinfo.textContent = warnF ? (PATH_LABEL[warnF.code] || "Path warning")
+        : path.summary ? "via " + path.summary : "not in flow export";
+      card.pathinfo.title = path.findings.map(function (f) { return f.text; }).join("\n");
+    } else {
+      card.pathinfo.textContent = "";
+      card.pathinfo.removeAttribute("title");
     }
     card.reason.textContent = s.reasons && s.reasons.length ? s.reasons[0] : "";
     card.reason.title = s.reasons ? s.reasons.join("\n") : "";
@@ -393,9 +409,38 @@
     tbl.appendChild(tr);
   }
 
+  function hopText(h, dir) {
+    var out = h.out_if_name || ("ifIndex " + h.out_if), inn = h.in_if_name || ("ifIndex " + h.in_if);
+    return h.appliance + ": in " + inn + (h.in_transport ? " (" + h.in_transport + ")" : "") +
+      " → out " + out + (h.out_transport ? " (" + h.out_transport + ")" : "") +
+      " · " + dscpName(h.dscp) + " · " + h.packets + " pkts · last " +
+      ago(Math.max(0, (Date.now() - h.last_ms) / 1000));
+  }
+  function renderPath(s) {
+    var box = $("d-path");
+    box.textContent = "";
+    if (s.kind !== "stamp") { box.appendChild(el("p", "muted", "Path validation applies to STAMP sessions.")); return; }
+    if (S.pathsUnavailable) { box.appendChild(el("p", "muted", S.pathsUnavailable)); return; }
+    var p = S.paths[s.key];
+    if (!p) { box.appendChild(el("p", "muted", "Waiting for flow data…")); return; }
+    [["Forward (probe → reflector)", p.forward], ["Return (reflector → probe)", p["return"]]].forEach(function (d) {
+      box.appendChild(el("div", "path-dir", d[0]));
+      var ul = el("ul", "path-hops");
+      if (!d[1].length) ul.appendChild(el("li", "muted", "not seen in the flow export"));
+      d[1].forEach(function (h) { ul.appendChild(el("li", h.dscp !== s.dscp ? "warn" : null, hopText(h))); });
+      box.appendChild(ul);
+    });
+    if (p.findings.length) {
+      var fl = el("ul", "reasons");
+      p.findings.forEach(function (f) { fl.appendChild(el("li", f.severity === "warn" ? "warn" : null, f.text)); });
+      box.appendChild(fl);
+    }
+  }
+
   function refreshDrawer(first) {
     var s = S.sessions[S.open];
     if (!s) return;
+    renderPath(s);
     $("d-title").textContent = s.session;
     $("d-sub").textContent = s.site + " · " + (KIND_LABEL[s.kind] || s.kind) + " · " + s.app_class + " · " + dscpName(s.dscp);
     var pill = $("d-pill");
@@ -405,6 +450,12 @@
     ul.textContent = "";
     (s.reasons.length ? s.reasons : ["All evaluated metrics are within target for " + s.effective_class + "."])
       .forEach(function (r) { ul.appendChild(el("li", null, r)); });
+    // A probe on the wrong path measures a path nobody uses: say so next to the verdict.
+    var pth = s.kind === "stamp" ? S.paths[s.key] : null;
+    if (pth && pth.status === "warn") {
+      ul.appendChild(el("li", "warn", "These results may not represent " + s.app_class +
+        " traffic: see Path below."));
+    }
 
     var xMax = latestTs();
     var th = classTh(s);
@@ -460,6 +511,19 @@
       b.setAttribute("aria-selected", String(b.dataset.range === S.histRange));
     });
   }
+
+  // Probe paths from the EdgeConnect flow export: near-real-time, so poll, not push.
+  function loadPaths() {
+    fetch("/v1/paths?minutes=5", { credentials: "same-origin", headers: { accept: "application/json" } })
+      .then(function (r) {
+        if (r.status === 401) { location.href = "/login"; throw new Error("login required"); }
+        return r.json().then(function (b) { if (!r.ok) throw new Error(b.error || ("HTTP " + r.status)); return b; });
+      })
+      .then(function (b) { S.paths = b.paths || {}; S.pathsUnavailable = null; render(); if (S.open) refreshDrawer(false); })
+      .catch(function (e) { S.pathsUnavailable = "Path data unavailable: " + e.message; });
+  }
+  setInterval(loadPaths, 30000);
+  setTimeout(loadPaths, 2000);
 
   function loadHistory() {
     var s = S.sessions[S.open];

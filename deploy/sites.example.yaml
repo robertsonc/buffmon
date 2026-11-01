@@ -1,0 +1,33 @@
+# buffmon-flows: exporter allowlist and site / interface map.
+# Install as /etc/buffmon/sites.yaml (0644, no secrets). Re-read within 30 s of
+# an edit; an edit that fails validation is logged and ignored.
+#
+# Flow records from an exporter that is NOT listed here are dropped and counted:
+# anyone who can reach the collector's UDP port could otherwise inject flows,
+# including fake probe paths.
+
+# UDP ports that identify probe traffic (your STAMP reflectors). Flows to or
+# from these ports are also kept in probe_flows for path validation.
+probe_ports: [862]
+
+exporters:
+  # Key: the source address the appliance exports IPFIX from (what goflow2
+  # reports as sampler_address). Usually the EdgeConnect's management or a
+  # loopback/LAN interface, depending on your export configuration.
+  "10.1.1.2":
+    site: SJC-BR01            # same site name the probes use
+    appliance: sjc-br01-ec1   # appliance hostname as in Orchestrator
+    # ifIndex -> name and underlay label. Take the ifIndex values from the
+    # export itself: the dashboard lists unmapped ones under "Path". Which
+    # ifIndex an overlay-carried flow reports as egress depends on the
+    # EdgeConnect release — confirm from a capture before relying on it.
+    interfaces:
+      2: { name: lan0 }
+      3: { name: wan0, transport: INET }
+      4: { name: wan1, transport: MPLS }
+      5: { name: lte0, transport: LTE }
+
+  "10.2.1.2":
+    site: NYC-BR02
+    appliance: nyc-br02-ec1
+    interfaces: {}
