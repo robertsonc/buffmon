@@ -82,6 +82,78 @@ pub struct StampTarget {
     /// loss split is then not reported.
     #[serde(default = "d_true")]
     pub stateful_reflector: bool,
+    /// Paris traceroute along this session's 5-tuple (on by default).
+    #[serde(default)]
+    pub trace: TraceConfig,
+    /// Packet-train capacity estimate (off unless `enabled = true`).
+    pub capacity: Option<CapacityConfig>,
+}
+
+/// `[stamp.trace]`: forward path tracing on the session's own flow.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TraceConfig {
+    #[serde(default = "d_true")]
+    pub enabled: bool,
+    /// Scheduled trace interval.
+    #[serde(default = "d_trace_interval_s")]
+    pub interval_s: u64,
+    /// Minimum time between traces triggered by a TTL change.
+    #[serde(default = "d_trace_min_gap_s")]
+    pub min_gap_s: u64,
+    #[serde(default = "d_trace_rounds")]
+    pub rounds: u8,
+    /// Upper bound when the forward hop count is not known yet.
+    #[serde(default = "d_trace_max_ttl")]
+    pub max_ttl: u8,
+    #[serde(default = "d_trace_round_timeout_ms")]
+    pub round_timeout_ms: u64,
+    /// Delay before the first trace, so the session has learned the hop count.
+    #[serde(default = "d_trace_start_delay_s")]
+    pub start_delay_s: u64,
+}
+
+impl Default for TraceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            interval_s: d_trace_interval_s(),
+            min_gap_s: d_trace_min_gap_s(),
+            rounds: d_trace_rounds(),
+            max_ttl: d_trace_max_ttl(),
+            round_timeout_ms: d_trace_round_timeout_ms(),
+            start_delay_s: d_trace_start_delay_s(),
+        }
+    }
+}
+
+/// `[stamp.capacity]`: forward bottleneck capacity from packet-train dispersion.
+/// Trains are bursts by design; enable per target, on networks where that is agreed.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CapacityConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Fixed source `ip:port` for the train socket (a separate STAMP session on
+    /// the reflector). Defaults to the session's source address, any port.
+    pub source: Option<String>,
+    #[serde(default = "d_cap_interval_s")]
+    pub interval_s: u64,
+    /// Packets per train.
+    #[serde(default = "d_cap_packets")]
+    pub packets: u32,
+    /// STAMP packet size (UDP payload octets).
+    #[serde(default = "d_cap_size")]
+    pub size: usize,
+    /// Trains per measurement; the result is their median.
+    #[serde(default = "d_cap_trains")]
+    pub trains: u32,
+    #[serde(default = "d_cap_train_gap_ms")]
+    pub train_gap_ms: u64,
+    /// DSCP for the trains; defaults to the session's.
+    pub dscp: Option<u8>,
+    #[serde(default = "d_cap_start_delay_s")]
+    pub start_delay_s: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -144,6 +216,42 @@ fn d_tcp_interval_ms() -> u64 {
 }
 fn d_true() -> bool {
     true
+}
+fn d_trace_interval_s() -> u64 {
+    300
+}
+fn d_trace_min_gap_s() -> u64 {
+    30
+}
+fn d_trace_rounds() -> u8 {
+    3
+}
+fn d_trace_max_ttl() -> u8 {
+    30
+}
+fn d_trace_round_timeout_ms() -> u64 {
+    1000
+}
+fn d_trace_start_delay_s() -> u64 {
+    3
+}
+fn d_cap_interval_s() -> u64 {
+    900
+}
+fn d_cap_packets() -> u32 {
+    48
+}
+fn d_cap_size() -> usize {
+    1200
+}
+fn d_cap_trains() -> u32 {
+    5
+}
+fn d_cap_train_gap_ms() -> u64 {
+    500
+}
+fn d_cap_start_delay_s() -> u64 {
+    10
 }
 
 fn valid_name(s: &str, max: usize) -> bool {
@@ -216,6 +324,10 @@ impl ProbeConfig {
                 parse_v4_endpoint(src, 0).map_err(|e| format!("stamp {}: source {e}", s.name))?;
             }
             check_pps(&format!("stamp {}", s.name), s.pps)?;
+            check_trace(&s.name, &s.trace)?;
+            if let Some(c) = &s.capacity {
+                check_capacity(&s.name, c)?;
+            }
             if !(crate::stamp::BASE_LEN..=crate::stamp::MAX_LEN).contains(&s.size) {
                 return Err(format!(
                     "stamp {}: size must be {}-{}",
@@ -282,6 +394,58 @@ fn check_timeout(what: &str, t: u64) -> Result<(), String> {
     } else {
         Err(format!("{what} must be 100-30000"))
     }
+}
+
+fn check_trace(name: &str, t: &TraceConfig) -> Result<(), String> {
+    let bad = |what: &str| Err(format!("stamp {name}: trace.{what}"));
+    if !(30..=86_400).contains(&t.interval_s) {
+        return bad("interval_s must be 30-86400");
+    }
+    if !(5..=3600).contains(&t.min_gap_s) {
+        return bad("min_gap_s must be 5-3600");
+    }
+    if !(1..=5).contains(&t.rounds) {
+        return bad("rounds must be 1-5");
+    }
+    if !(1..=crate::trace::MAX_TTL).contains(&t.max_ttl) {
+        return Err(format!("stamp {name}: trace.max_ttl must be 1-{}", crate::trace::MAX_TTL));
+    }
+    if !(200..=5000).contains(&t.round_timeout_ms) {
+        return bad("round_timeout_ms must be 200-5000");
+    }
+    if t.start_delay_s > 60 {
+        return bad("start_delay_s must be 0-60");
+    }
+    Ok(())
+}
+
+fn check_capacity(name: &str, c: &CapacityConfig) -> Result<(), String> {
+    let bad = |what: &str| Err(format!("stamp {name}: capacity.{what}"));
+    if let Some(src) = &c.source {
+        parse_v4_endpoint(src, 0).map_err(|e| format!("stamp {name}: capacity.source {e}"))?;
+    }
+    if !(60..=86_400).contains(&c.interval_s) {
+        return bad("interval_s must be 60-86400");
+    }
+    if !(8..=128).contains(&c.packets) {
+        return bad("packets must be 8-128");
+    }
+    if !(200..=crate::stamp::MAX_LEN).contains(&c.size) {
+        return Err(format!("stamp {name}: capacity.size must be 200-{}", crate::stamp::MAX_LEN));
+    }
+    if !(1..=10).contains(&c.trains) {
+        return bad("trains must be 1-10");
+    }
+    if !(100..=10_000).contains(&c.train_gap_ms) {
+        return bad("train_gap_ms must be 100-10000");
+    }
+    if c.dscp.is_some_and(|d| d > 63) {
+        return bad("dscp must be 0-63");
+    }
+    if c.start_delay_s > 3600 {
+        return bad("start_delay_s must be 0-3600");
+    }
+    Ok(())
 }
 
 fn check_pps(what: &str, pps: f64) -> Result<(), String> {
@@ -381,6 +545,29 @@ mod tests {
         let c: ProbeConfig =
             toml::from_str(&MIN.replace("https://ingest.example:8443", "http://127.0.0.1:8080")).unwrap();
         c.validate().unwrap();
+    }
+
+    #[test]
+    fn trace_is_on_and_capacity_off_by_default() {
+        let c: ProbeConfig = toml::from_str(MIN).unwrap();
+        assert!(c.stamp[0].trace.enabled && c.stamp[0].trace.interval_s == 300);
+        assert!(c.stamp[0].capacity.is_none());
+        let with = format!("{MIN}\n[stamp.trace]\ninterval_s = 60\n[stamp.capacity]\nenabled = true\npackets = 64\n");
+        let c: ProbeConfig = toml::from_str(&with).unwrap();
+        c.validate().unwrap();
+        assert_eq!(c.stamp[0].trace.interval_s, 60);
+        let cap = c.stamp[0].capacity.as_ref().unwrap();
+        assert!(cap.enabled && cap.packets == 64 && cap.size == 1200 && cap.trains == 5);
+        for (bad, msg) in [
+            ("[stamp.trace]\ninterval_s = 5", "trace.interval_s"),
+            ("[stamp.trace]\nmax_ttl = 40", "trace.max_ttl"),
+            ("[stamp.capacity]\nenabled = true\npackets = 1000", "capacity.packets"),
+            ("[stamp.capacity]\nenabled = true\nsize = 9000", "capacity.size"),
+            ("[stamp.capacity]\nenabled = true\ninterval_s = 10", "capacity.interval_s"),
+        ] {
+            let c: ProbeConfig = toml::from_str(&format!("{MIN}\n{bad}\n")).unwrap();
+            assert!(c.validate().unwrap_err().contains(msg), "{bad}");
+        }
     }
 
     #[test]

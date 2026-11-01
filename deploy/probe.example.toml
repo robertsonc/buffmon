@@ -56,6 +56,18 @@ source = "0.0.0.0:40003"
 pps = 5
 dscp = 0
 app_class = "bulk"
+# Route tracing is on for every STAMP session: a Paris traceroute on the
+# session's own 5-tuple and DSCP at start, every interval_s, and within seconds
+# of the STAMP TTLs changing. A handful of small packets per trace.
+# [stamp.trace]
+# interval_s = 300
+# Packet-train capacity: bursts by design (here 5 trains of 48 x 1200 B every
+# 15 min). Off unless enabled; agree it per network first. A best-effort
+# session is the right place: trains in EF can trip a priority-queue policer.
+# [stamp.capacity]
+# enabled = true
+# source = "0.0.0.0:40013"   # fixed source port, so the trains are findable in IPFIX
+# interval_s = 900
 
 # A third-party reflector (e.g. a router's STAMP/TWAMP-light responder) is
 # usually stateless: the forward/return split is then not reported.

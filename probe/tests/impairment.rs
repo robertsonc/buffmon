@@ -5,6 +5,7 @@
 //! forward/return split must come out exact, not approximately right.
 
 use buffmon_probe::config::ProbeConfig;
+use buffmon_probe::output::Item;
 use buffmon_probe::record::Record;
 use buffmon_probe::reflector::{Reflector, ReflectorConfig};
 use buffmon_probe::stamp_session;
@@ -80,7 +81,7 @@ fn run(drop: Drop) -> Vec<Record> {
     let deadline = Instant::now() + Duration::from_millis(4_500);
     let mut records = Vec::new();
     while Instant::now() < deadline {
-        if let Ok(r) = rx.recv_timeout(Duration::from_millis(50)) {
+        if let Ok(Item::Record(r)) = rx.recv_timeout(Duration::from_millis(50)) {
             records.push(r);
         }
     }

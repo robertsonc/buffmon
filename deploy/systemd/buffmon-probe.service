@@ -21,7 +21,8 @@ LoadCredential=probe-token:/etc/buffmon/probe-token
 
 # --- Privileges ----------------------------------------------------------------
 DynamicUser=yes
-# Raw ICMP sockets. Nothing else.
+# Raw ICMP sockets (ICMP sessions, and reading routers' replies to route
+# traces). Nothing else.
 AmbientCapabilities=CAP_NET_RAW
 CapabilityBoundingSet=CAP_NET_RAW
 NoNewPrivileges=yes

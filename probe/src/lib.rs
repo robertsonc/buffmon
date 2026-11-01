@@ -2,11 +2,14 @@
 //!
 //! STAMP (RFC 8762) sender and stateful reflector, ICMP echo and TCP connect
 //! probes. Every session produces one record per second in the format defined by
-//! `docs/PROBE-RECORD.md`.
+//! `docs/PROBE-RECORD.md`. STAMP sessions also trace their forward path (Paris
+//! traceroute on the session's own flow) and, where enabled, estimate the
+//! forward bottleneck capacity from packet trains.
 
 #[cfg(not(target_os = "linux"))]
 compile_error!("buffmon-probe targets Linux: it relies on SO_TIMESTAMPNS, IP_RECVTTL/IP_RECVTOS and raw sockets.");
 
+pub mod capacity;
 pub mod clock;
 pub mod config;
 pub mod icmp;
@@ -18,6 +21,7 @@ pub mod stamp;
 pub mod stamp_session;
 pub mod sys;
 pub mod tcp;
+pub mod trace;
 pub mod tracker;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

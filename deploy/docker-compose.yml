@@ -24,6 +24,7 @@ services:
       - ./clickhouse/001_schema.sql:/docker-entrypoint-initdb.d/001_schema.sql:ro
       - ./clickhouse/002_flows.sql:/docker-entrypoint-initdb.d/002_flows.sql:ro
       - ./clickhouse/003_tunnel_stats.sql:/docker-entrypoint-initdb.d/003_tunnel_stats.sql:ro
+      - ./clickhouse/004_routes.sql:/docker-entrypoint-initdb.d/004_routes.sql:ro
     ports:
       - "127.0.0.1:8123:8123"     # HTTP interface, host-local only (ops/debug)
     ulimits:

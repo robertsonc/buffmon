@@ -2,6 +2,7 @@
 //! echo, and TCP connect, each producing records through the public API.
 
 use buffmon_probe::config::ProbeConfig;
+use buffmon_probe::output::Item;
 use buffmon_probe::record::Record;
 use buffmon_probe::reflector::{Reflector, ReflectorConfig};
 use buffmon_probe::stamp::{ReflectorPacket, SenderPacket};
@@ -39,13 +40,13 @@ fn probe_config(body: &str) -> ProbeConfig {
     cfg
 }
 
-/// Collects records for `run_for`, then stops the sessions and drains.
-fn collect(
-    rx: mpsc::Receiver<Record>,
+/// Collects everything sessions emit for `run_for`, then stops them and drains.
+fn collect_items(
+    rx: mpsc::Receiver<Item>,
     stop: &AtomicBool,
     handles: Vec<JoinHandle<()>>,
     run_for: Duration,
-) -> Vec<Record> {
+) -> Vec<Item> {
     let deadline = Instant::now() + run_for;
     let mut out = Vec::new();
     while Instant::now() < deadline {
@@ -59,6 +60,22 @@ fn collect(
     }
     out.extend(rx.try_iter());
     out
+}
+
+/// As [`collect_items`], keeping only the per-second records.
+fn collect(
+    rx: mpsc::Receiver<Item>,
+    stop: &AtomicBool,
+    handles: Vec<JoinHandle<()>>,
+    run_for: Duration,
+) -> Vec<Record> {
+    collect_items(rx, stop, handles, run_for)
+        .into_iter()
+        .filter_map(|i| match i {
+            Item::Record(r) => Some(r),
+            _ => None,
+        })
+        .collect()
 }
 
 #[test]

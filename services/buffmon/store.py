@@ -30,8 +30,10 @@ SECOND_TABLE = "probe_second"
 MINUTE_TABLE = "probe_minute"
 FLOWS_TABLE = "flows"
 PROBE_FLOWS_TABLE = "probe_flows"
+ROUTE_TABLE = "route_traces"
+CAPACITY_TABLE = "capacity"
 # Tables the ingest side may write. Anything else is refused before a request is made.
-_TABLES = frozenset({SECOND_TABLE, FLOWS_TABLE, PROBE_FLOWS_TABLE})
+_TABLES = frozenset({SECOND_TABLE, FLOWS_TABLE, PROBE_FLOWS_TABLE, ROUTE_TABLE, CAPACITY_TABLE})
 
 # range key -> (span seconds, bucket seconds, source table)
 HISTORY_RANGES: dict[str, tuple[int, int, str]] = {
@@ -119,7 +121,7 @@ class HttpTransport:
         await self._client.aclose()
 
 
-def _ts_text(ts_ms: int) -> str:
+def ts_text(ts_ms: int) -> str:
     return datetime.fromtimestamp(ts_ms / 1000, tz=UTC).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
 
 
@@ -127,7 +129,7 @@ def record_to_row(rec: ProbeRecord) -> dict[str, Any]:
     src_ip, src_port = parse_endpoint(rec.src)
     dst_ip, dst_port = parse_endpoint(rec.dst)
     return {
-        "ts": _ts_text(rec.ts_ms),
+        "ts": ts_text(rec.ts_ms),
         "probe_id": rec.probe_id,
         "site": rec.site,
         "session": rec.session,

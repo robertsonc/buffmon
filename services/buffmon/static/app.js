@@ -21,7 +21,7 @@
   var LIVE_MS = 15 * 60 * 1000;
 
   var S = {
-    sessions: {}, list: [], series: {}, thresholds: null, retentionMs: 900000, paths: {}, pathsUnavailable: null, tunnels: [],
+    sessions: {}, list: [], series: {}, thresholds: null, retentionMs: 900000, paths: {}, pathsUnavailable: null, tunnels: [], routes: {},
     filterStatus: null, search: "", cls: "", kind: "", lastMsgAt: 0, retry: 0,
     open: null, histRange: "1h", histTimer: null, cards: {}, siteEls: {}, ever: false,
   };
@@ -306,12 +306,19 @@
       e.box.title = m.title || "";
     });
     card.footText.textContent = footFor(s).join("   ·   ");
-    if (s.path_change) {
+    var rc = recentRouteChange(s, xMax);
+    if (rc && (!s.path_change || rc.ts_ms >= s.path_change.ts_ms)) {
+      card.pathchg.textContent = "Route changed" + (rc.change_ttl ? " at hop " + rc.change_ttl : "") + ", " +
+        ago((xMax - rc.ts_ms) / 1000);
+      card.pathchg.title = rc.prev_signature + "\n→ " + rc.signature;
+    } else if (s.path_change) {
       var pc = s.path_change;
       card.pathchg.textContent = "Path change " + (pc.direction === "fwd" ? "→" : "←") + " " +
         pc.hops_from + "→" + pc.hops_to + " hops, " + ago((xMax - pc.ts_ms) / 1000);
+      card.pathchg.removeAttribute("title");
     } else {
       card.pathchg.textContent = "";
+      card.pathchg.removeAttribute("title");
     }
     var path = s.kind === "stamp" ? S.paths[s.key] : null;
     if (path) {
@@ -437,6 +444,69 @@
     }
   }
 
+  // -- forward route (traceroute on the session's own flow) and capacity ------
+  var ROUTE_CHANGE_RECENT_MS = 60 * 60 * 1000;
+  function recentRouteChange(s, now) {
+    var r = s.kind === "stamp" ? S.routes[s.key] : null;
+    var c = r && r.changes && r.changes[0];
+    return c && now - c.ts_ms <= ROUTE_CHANGE_RECENT_MS ? c : null;
+  }
+  function fmtBps(v) {
+    if (v == null) return "–";
+    return v >= 1e9 ? (v / 1e9).toFixed(2) + " Gbit/s" : (v / 1e6).toFixed(v >= 1e8 ? 0 : 1) + " Mbit/s";
+  }
+  var TRIGGER = { start: "at start", schedule: "scheduled", ttl_change: "after a TTL change" };
+  function renderRoute(s) {
+    var box = $("d-route");
+    box.textContent = "";
+    if (s.kind !== "stamp") { box.appendChild(el("p", "muted", "Route tracing applies to STAMP sessions.")); return; }
+    var e = S.routes[s.key];
+    var now = Date.now();
+    if (!e || !e.route) {
+      box.appendChild(el("p", "muted", "No trace yet. The probe traces at start and every few minutes " +
+        "(it needs CAP_NET_RAW to read the routers' replies)."));
+    } else {
+      var r = e.route;
+      var n = r.hop_count_fwd == null ? "unknown number of" : r.hop_count_fwd;
+      box.appendChild(el("div", "path-dir", "Forward, " + n + " router(s) · traced " + ago((now - r.ts_ms) / 1000) +
+        " (" + (TRIGGER[r.trigger] || r.trigger) + ")" + (r.complete ? "" : " · some routers did not answer")));
+      var ol = el("ul", "path-hops");
+      r.hops.forEach(function (h) {
+        var text = h.ttl + ". " + (h.addrs.length ? h.addrs.join(", ") : "* no reply") +
+          (h.rtt_us != null ? " · " + (h.rtt_us < 1000 ? (h.rtt_us / 1000).toFixed(2) : fmtMs(h.rtt_us / 1000)) + " ms" : "") +
+          (h.unreachable != null ? " · unreachable (code " + h.unreachable + ")" : "");
+        var changedHop = e.changes[0] && e.changes[0].ts_ms === r.ts_ms && e.changes[0].change_ttl === h.ttl;
+        ol.appendChild(el("li", changedHop || h.unreachable != null ? "warn" : null, text));
+      });
+      ol.appendChild(el("li", "muted", (r.hop_count_fwd == null ? "?" : r.hop_count_fwd + 1) + ". " + target(s) + " (reflector)"));
+      box.appendChild(ol);
+      if (r.multipath) box.appendChild(el("p", "muted", "Several routers answered for one hop: per-packet load balancing, or the route moved during the trace."));
+      if (e.changes.length) {
+        var cl = el("ul", "reasons");
+        e.changes.slice(0, 3).forEach(function (c) {
+          cl.appendChild(el("li", now - c.ts_ms <= ROUTE_CHANGE_RECENT_MS ? "warn" : null,
+            "Route changed " + ago((now - c.ts_ms) / 1000) + (c.change_ttl ? " at hop " + c.change_ttl : " (hop count)") +
+            ": " + c.prev_signature + " → " + c.signature));
+        });
+        box.appendChild(cl);
+      }
+    }
+    var c = e && e.capacity;
+    if (c) {
+      box.appendChild(el("div", "path-dir", "Capacity · packet trains (" + c.valid_trains + "/" + c.trains + " trains of " +
+        c.packets + " × " + c.size + " B, " + dscpName(c.dscp) + ") · " + ago((now - c.ts_ms) / 1000)));
+      var cu = el("ul", "path-hops");
+      cu.appendChild(el("li", null, "→ " + fmtBps(c.fwd_bps) +
+        (c.fwd_bps_min != null ? " (trains " + fmtBps(c.fwd_bps_min) + " – " + fmtBps(c.fwd_bps_max) + ")" : "")));
+      if (c.burst_bytes != null) {
+        cu.appendChild(el("li", null, "Shaper burst: ~" + Math.round(c.burst_bytes / 1024) + " KB passes ahead of the sustained rate (" +
+          c.burst_trains + "/" + c.valid_trains + " trains)"));
+      }
+      cu.appendChild(el("li", null, "← " + (c.back_bps == null ? "–" : (c.back_is_lower_bound ? "at least " : "") + fmtBps(c.back_bps))));
+      box.appendChild(cu);
+    }
+  }
+
   function renderPathTunnels(s) {
     var box = $("d-tunnels");
     box.textContent = "";
@@ -458,6 +528,7 @@
   function refreshDrawer(first) {
     var s = S.sessions[S.open];
     if (!s) return;
+    renderRoute(s);
     renderPath(s);
     renderPathTunnels(s);
     $("d-title").textContent = s.session;
@@ -607,6 +678,19 @@
   }
   setInterval(loadPaths, 30000);
   setTimeout(loadPaths, 2000);
+
+  // Route traces and capacity: minutes apart, so poll.
+  function loadRoutes() {
+    fetch("/v1/routes", { credentials: "same-origin", headers: { accept: "application/json" } })
+      .then(function (r) {
+        if (r.status === 401) { location.href = "/login"; throw new Error("login required"); }
+        return r.json().then(function (b) { if (!r.ok) throw new Error(b.error || ("HTTP " + r.status)); return b; });
+      })
+      .then(function (b) { S.routes = b.sessions || {}; render(); if (S.open) refreshDrawer(false); })
+      .catch(function () { /* keep the last known routes */ });
+  }
+  setInterval(loadRoutes, 30000);
+  setTimeout(loadRoutes, 2500);
 
   function loadHistory() {
     var s = S.sessions[S.open];

@@ -1,0 +1,8 @@
+# Build output
+probe/target/
+__pycache__/
+*.py[co]
+.venv/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/

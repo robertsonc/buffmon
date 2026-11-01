@@ -149,6 +149,100 @@ pub fn send_to_tos(fd: RawFd, payload: &[u8], dst: SocketAddrV4, tos: Option<u8>
     }
 }
 
+/// `sendmsg` on a connected socket with the IP TTL overridden for this packet
+/// only (`IP_TTL` ancillary data). Everything else (addresses, ports, TOS)
+/// stays the socket's, which is what makes a traceroute follow the same flow.
+pub fn send_with_ttl(fd: RawFd, payload: &[u8], ttl: u8) -> io::Result<usize> {
+    // SAFETY: as in send_to_tos; no destination (the socket is connected) and
+    // one c_int cmsg in a buffer much larger than CMSG_SPACE(4).
+    unsafe {
+        let mut iov = libc::iovec { iov_base: payload.as_ptr() as *mut libc::c_void, iov_len: payload.len() };
+        let mut control = CmsgBuf([0; 256]);
+        let mut msg: libc::msghdr = zeroed();
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = control.0.as_mut_ptr().cast();
+        msg.msg_controllen = libc::CMSG_SPACE(size_of::<libc::c_int>() as u32) as _;
+        let cmsg = libc::CMSG_FIRSTHDR(&msg);
+        (*cmsg).cmsg_level = libc::IPPROTO_IP;
+        (*cmsg).cmsg_type = libc::IP_TTL;
+        (*cmsg).cmsg_len = libc::CMSG_LEN(size_of::<libc::c_int>() as u32) as _;
+        std::ptr::write_unaligned(libc::CMSG_DATA(cmsg).cast::<libc::c_int>(), libc::c_int::from(ttl));
+        let n = libc::sendmsg(fd, &msg, 0);
+        if n < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(n as usize)
+        }
+    }
+}
+
+/// Sends every buffer on a connected socket with as few syscalls as possible
+/// (`sendmmsg`), so a packet train leaves back to back. Returns how many were sent.
+pub fn send_many(fd: RawFd, bufs: &[Vec<u8>]) -> io::Result<usize> {
+    let mut iovs: Vec<libc::iovec> =
+        bufs.iter().map(|b| libc::iovec { iov_base: b.as_ptr() as *mut libc::c_void, iov_len: b.len() }).collect();
+    // SAFETY: mmsghdr is POD; every msg_hdr points at one iovec that lives in
+    // `iovs` (not moved after this point), whose buffer lives in `bufs`.
+    let mut msgs: Vec<libc::mmsghdr> = iovs
+        .iter_mut()
+        .map(|iov| unsafe {
+            let mut m: libc::mmsghdr = zeroed();
+            m.msg_hdr.msg_iov = iov;
+            m.msg_hdr.msg_iovlen = 1;
+            m
+        })
+        .collect();
+    let mut sent = 0;
+    while sent < msgs.len() {
+        // SAFETY: the pointer and count describe the unsent tail of `msgs`.
+        let rc = unsafe { libc::sendmmsg(fd, msgs[sent..].as_mut_ptr(), (msgs.len() - sent) as libc::c_uint, 0) };
+        if rc < 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return if sent > 0 { Ok(sent) } else { Err(err) };
+        }
+        if rc == 0 {
+            break;
+        }
+        sent += rc as usize;
+    }
+    Ok(sent)
+}
+
+/// The socket's default IP TTL (what the kernel puts in unicast packets).
+pub fn ip_ttl(fd: RawFd) -> io::Result<u8> {
+    let mut v: libc::c_int = 0;
+    let mut len = size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: c_int out-parameter with its size.
+    let rc =
+        unsafe { libc::getsockopt(fd, libc::IPPROTO_IP, libc::IP_TTL, (&mut v as *mut libc::c_int).cast(), &mut len) };
+    if rc == 0 {
+        u8::try_from(v).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, format!("IP_TTL {v}")))
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+/// Limits a raw ICMP socket to the given ICMP types (`ICMP_FILTER`, Linux).
+pub fn icmp_filter(fd: RawFd, allowed_types: &[u8]) -> io::Result<()> {
+    const SOL_RAW: libc::c_int = 255;
+    const ICMP_FILTER: libc::c_int = 1;
+    // Bit n set = ICMP type n is filtered out.
+    let mask: u32 = !allowed_types.iter().filter(|t| **t < 32).fold(0_u32, |m, t| m | (1 << t));
+    // SAFETY: u32 option value with its size.
+    let rc = unsafe {
+        libc::setsockopt(fd, SOL_RAW, ICMP_FILTER, (&mask as *const u32).cast(), size_of::<u32>() as libc::socklen_t)
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
 /// The kernel's smoothed RTT for a connected TCP socket, in microseconds.
 /// Right after the handshake this is the SYN → SYN-ACK sample.
 pub fn tcp_rtt_us(fd: RawFd) -> Option<u32> {

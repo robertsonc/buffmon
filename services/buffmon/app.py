@@ -27,6 +27,16 @@ from .dedup import RecentKeys
 from .flows.path import analyse, query_paths
 from .live import WINDOWS_S, LiveHub
 from .models import NAME_PATTERN, IngestBatch, ProbeRecord
+from .routes import (
+    CAPACITY_TABLE,
+    ROUTE_TABLE,
+    CapacityResult,
+    RouteResult,
+    RouteView,
+    capacity_to_row,
+    query_route_history,
+    route_to_row,
+)
 from .store import HISTORY_RANGES, ClickHouseError, HttpTransport, SampleWriter, Transport, query_history, record_to_row
 from .thresholds import ThresholdsFile
 from .tunnels import query_tunnels
@@ -68,6 +78,9 @@ class AppState:
     transport: Transport | None
     writer: SampleWriter | None
     clock: Callable[[], float]
+    route_writer: SampleWriter | None = None
+    capacity_writer: SampleWriter | None = None
+    routes: RouteView = field(default_factory=RouteView)
     counters: Counters = field(default_factory=Counters)
     started_at: float = field(default_factory=time.time)
 
@@ -144,6 +157,11 @@ def build_state(settings: Settings, transport: Transport | None, clock: Callable
         if transport is not None
         else None
     )
+    side_writers = {
+        table: SampleWriter(transport, batch_max=1000, flush_interval_s=settings.insert_flush_interval_s,
+                            buffer_max=20_000, retry_max_s=settings.insert_retry_max_s, table=table)
+        for table in (ROUTE_TABLE, CAPACITY_TABLE)
+    } if transport is not None else {}
     if writer is None:
         log.warning("ClickHouse is disabled: live view only, nothing is stored and history is unavailable")
     return AppState(
@@ -168,6 +186,8 @@ def build_state(settings: Settings, transport: Transport | None, clock: Callable
         transport=transport,
         writer=writer,
         clock=clock,
+        route_writer=side_writers.get(ROUTE_TABLE),
+        capacity_writer=side_writers.get(CAPACITY_TABLE),
     )
 
 
@@ -184,6 +204,9 @@ def create_app(
         tasks: list[asyncio.Task[None]] = []
         if state.writer is not None:
             tasks.append(asyncio.create_task(state.writer.run(stop), name="clickhouse-writer"))
+        for w in (state.route_writer, state.capacity_writer):
+            if w is not None:
+                tasks.append(asyncio.create_task(w.run(stop), name="clickhouse-writer"))
         tasks.append(asyncio.create_task(_housekeeping(state, stop), name="housekeeping"))
         try:
             yield
@@ -192,11 +215,12 @@ def create_app(
             for t in tasks:
                 with contextlib.suppress(asyncio.CancelledError):
                     await asyncio.wait_for(t, timeout=5)
-            if state.writer is not None and state.writer.depth:
-                try:
-                    await asyncio.wait_for(state.writer.flush_once(), timeout=10)
-                except TimeoutError:
-                    log.warning("shutdown flush timed out with %d rows unwritten", state.writer.depth)
+            for w in (state.writer, state.route_writer, state.capacity_writer):
+                if w is not None and w.depth:
+                    try:
+                        await asyncio.wait_for(w.flush_once(), timeout=10)
+                    except TimeoutError:
+                        log.warning("shutdown flush timed out with %d rows unwritten", w.depth)
             if state.transport is not None:
                 await state.transport.aclose()
 
@@ -250,7 +274,7 @@ def create_app(
             c.auth_failures += 1
             log.warning("probe token for %s used to submit probe_id %s", probe_id, batch.probe_id)
             return JSONResponse({"error": "token is not valid for this probe_id"}, status_code=403)
-        if len(batch.records) > state.settings.max_records:
+        if len(batch.records) + len(batch.routes) + len(batch.capacity) > state.settings.max_records:
             return JSONResponse(
                 {"error": f"at most {state.settings.max_records} records per request; split the batch"},
                 status_code=413,
@@ -286,12 +310,52 @@ def create_app(
 
         if state.writer is not None:
             state.writer.enqueue(rows)
+
+        # Phase 3 results: same checks (token, clock skew, idempotency), their own tables.
+        route_rows: list[dict[str, Any]] = []
+        capacity_rows: list[dict[str, Any]] = []
+        sections: tuple[tuple[str, list[object], type[RouteResult] | type[CapacityResult]], ...] = (
+            ("routes", batch.routes, RouteResult),
+            ("capacity", batch.capacity, CapacityResult),
+        )
+        for section, items, model in sections:
+            for i, raw in enumerate(items):
+                try:
+                    res = model.model_validate(raw)
+                except ValidationError as exc:
+                    rejected += 1
+                    errors.append({"section": section, "index": i, "error": _short_validation_error(exc)})
+                    continue
+                if res.probe_id != probe_id:
+                    rejected += 1
+                    errors.append({"section": section, "index": i, "error": "probe_id does not match the token"})
+                    continue
+                if abs(res.ts_ms - now_ms) > skew:
+                    rejected += 1
+                    errors.append({"section": section, "index": i,
+                                   "error": "ts_ms is more than 24 h from server time; check the probe clock"})
+                    continue
+                if state.dedup.seen(res.key):
+                    duplicates += 1
+                    continue
+                state.dedup.add(res.key)
+                if isinstance(res, RouteResult):
+                    state.routes.add_route(res)
+                    route_rows.append(route_to_row(res))
+                else:
+                    state.routes.add_capacity(res)
+                    capacity_rows.append(capacity_to_row(res))
+                accepted += 1
+        if state.route_writer is not None:
+            state.route_writer.enqueue(route_rows)
+        if state.capacity_writer is not None:
+            state.capacity_writer.enqueue(capacity_rows)
         c.accepted += accepted
         c.duplicates += duplicates
         c.rejected += rejected
         if rejected:
-            log.warning("probe %s: rejected %d of %d records (first: %s)", probe_id, rejected,
-                        len(batch.records), errors[0]["error"])
+            log.warning("probe %s: rejected %d of %d results (first: %s)", probe_id, rejected,
+                        len(batch.records) + len(batch.routes) + len(batch.capacity), errors[0]["error"])
         return JSONResponse(
             {"accepted": accepted, "duplicates": duplicates, "rejected": rejected, "errors": errors[:20]}
         )
@@ -310,6 +374,9 @@ def create_app(
                     "uptime_s": round(time.time() - state.started_at, 1),
                     "ingest": state.counters.__dict__,
                     "store": store if store is not None else {"enabled": False},
+                    "store_routes": state.route_writer.status() if state.route_writer is not None else None,
+                    "store_capacity": state.capacity_writer.status() if state.capacity_writer is not None else None,
+                    "routes": {"sessions": len(state.routes)},
                     "live": {"sessions": len(state.hub.sessions), "seq": state.hub.seq},
                     "dedup_keys": len(state.dedup),
                     "probe_tokens": state.tokens.count,
@@ -378,6 +445,33 @@ def create_app(
         if not 1 <= minutes <= 60:
             return JSONResponse({"error": "minutes must be 1-60"}, status_code=400)
         return await _paths(minutes, f"{probe_id}/{session}")
+
+    # -- forward route traces and capacity (probe, Phase 3) ------------------
+    @app.get("/v1/routes")
+    async def routes(request: Request) -> JSONResponse:
+        """Latest route trace, recent route changes and latest capacity per session
+        (in memory; the dashboard polls this)."""
+        if not ui_ok(request):
+            return unauthorized()
+        return JSONResponse({"server_ms": int(state.clock() * 1000), "sessions": state.routes.snapshot()})
+
+    @app.get("/v1/sessions/{probe_id}/{session}/routes")
+    async def session_routes(request: Request, probe_id: str, session: str, hours: int = 24) -> JSONResponse:
+        if not ui_ok(request):
+            return unauthorized()
+        if not _NAME_RE.match(probe_id) or not _NAME_RE.match(session):
+            return JSONResponse({"error": "invalid probe_id or session"}, status_code=400)
+        if not 1 <= hours <= 24 * 90:
+            return JSONResponse({"error": "hours must be 1-2160"}, status_code=400)
+        if state.transport is None:
+            return JSONResponse({"error": "route history unavailable: ClickHouse is disabled"}, status_code=503)
+        from_ms = int(state.clock() * 1000) - hours * 3_600_000
+        try:
+            data = await query_route_history(state.transport, probe_id, session, from_ms)
+        except ClickHouseError as exc:
+            log.warning("route history query failed: %s", exc)
+            return JSONResponse({"error": "route history unavailable: storage query failed"}, status_code=503)
+        return JSONResponse(data)
 
     # -- EdgeConnect tunnel health (Orchestrator, via buffmon-orch-poll) -----
     @app.get("/v1/tunnels")

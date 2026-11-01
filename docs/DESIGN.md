@@ -135,6 +135,48 @@ up to `timeout` later when a packet is lost, and up to a further 3 s when the
 forward/return split is waiting for the next reply. See `docs/PROBE-RECORD.md`
 for the wire format.
 
+### Route and capacity (Phase 3)
+
+**Route trace** (every STAMP session, on by default):
+
+- Paris traceroute sent from the STAMP session's **own socket**, so the 5-tuple
+  and DSCP are the probes': ECMP hashing and EdgeConnect overlay policy put the
+  trace on the same path as the measurement. Only the TTL (per packet, as
+  ancillary data) and the payload length differ.
+- Payload is 9-40 octets, below STAMP's 44, so a reflector discards trace
+  packets and the session's loss accounting never sees them. The UDP length in
+  the header a router quotes back identifies the TTL; every router quotes at
+  least those 8 octets, and NAT preserves them.
+- TTLs 1..*n*, where *n* = sent TTL − the TTL the reflector reports (the
+  forward router count); 3 rounds, one probe per router per round (routers
+  rate-limit Time Exceeded). Replies on a raw ICMP socket (CAP_NET_RAW).
+- Runs at start, every `interval_s` (300 s) and, as a **tripwire**, within
+  ~1 s of the STAMP TTLs changing (forward or return; 3 equal replies in a row).
+- Change = a TTL where routers answered both times and none of the addresses
+  match the ones seen since the last change, or a different router count. A
+  silent hop is never a change; per-packet load balancing is absorbed.
+- Limits: forward hops only (a return change shows as `ttl_back` moving); an
+  EdgeConnect overlay is one hop (the tunnel hides the underlay); a proxy (SSE)
+  ends the visible route at the proxy.
+
+**Capacity** (per STAMP session, off unless enabled):
+
+- `trains` × `packets` back-to-back STAMP packets of `size` octets (`sendmmsg`),
+  on a separate socket (its own reflector session), same destination, DSCP
+  configurable. The reflector's kernel receive timestamps (T2) give the spacing
+  at the far end; only differences of one clock are used, so no sync is needed.
+- **Sustained rate** from the median gap after any leading burst: token-bucket
+  shapers pass the head of a train at line rate, so whole-train dispersion
+  overestimates. The burst is reported separately (octets ahead of the rate).
+- Return: the reflector replies as packets arrive, so the return train starts
+  spaced like the forward one. Wider on arrival (T4 vs T3) means a narrower
+  return bottleneck, measured; otherwise only a floor.
+- Trains with reordering, > 50% loss, no spread or a sender slower than half
+  the arrival spread are discarded; median over the rest; IP-layer bit/s.
+- Through EdgeConnect this is the overlay's capacity as the appliance shapes it
+  for that DSCP, not the underlay link. Packet order correction and per-packet
+  path spraying can re-space trains: `fwd_bps_min`/`max` show when they did.
+
 ## 6. Health model
 
 Per session, over rolling windows:

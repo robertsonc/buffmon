@@ -144,3 +144,6 @@ class IngestBatch(BaseModel):
 
     probe_id: Annotated[str, Field(pattern=NAME_PATTERN)]
     records: list[object]
+    # Phase 3 (optional): forward route traces and capacity measurements.
+    routes: list[object] = []
+    capacity: list[object] = []
