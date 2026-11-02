@@ -290,7 +290,7 @@ Per session, over rolling windows:
 | P3 (done, lab-verified) | Path characterisation: Paris-style traceroute with change detection; packet-train capacity estimate | Path changes flagged within one cycle; capacity estimate within ±20% of a known shaped rate on wired lab links |
 | P3.1 (done) | Authenticated STAMP (RFC 8762 authenticated mode) and RFC 8972 TLVs (Extra Padding, HMAC) in probe and reflector; per-session keys | Authenticated and unauthenticated sessions run side by side against one reflector; a packet with a bad HMAC or unknown SSID is refused; byte layouts match the RFC figures |
 | P3.2 (done, lab-verified) | RFC 10052 return-direction trains: reflector support (off by default, authenticated sessions only, rate and volume limits, replay check) and probe-side return capacity | Return capacity measured, not bounded, within ±20% of a known shaped return rate; limits and the C flag verified |
-| P3.3 (built; lab run pending) | RFC 9946 (UDPSTP) speed test as a guarded, on-demand test type, scheduled by the collector (one per appliance/overlay) | Upstream and downstream Maximum IP-Layer Capacity within ±10% of a shaped lab rate; refused without an explicit enable, above the rate cap, in a priority DSCP, or while another test runs behind the same appliance |
+| P3.3 (done, lab-verified) | RFC 9946 (UDPSTP) speed test as a guarded, on-demand test type, scheduled by the collector (one per appliance/overlay) | Upstream and downstream Maximum IP-Layer Capacity within ±10% of a shaped lab rate; refused without an explicit enable, above the rate cap, in a priority DSCP, or while another test runs behind the same appliance |
 | P4 | Identity graph: ClearPass, DHCP, Central/Mist; enrichment on arrival | Any IP at any time resolves to MAC, device and user where the sources know them |
 | P5 | UXI and HPE SSE ingestion; segment view; UXI as control group; wireless probes with radio context (D15) | One screen shows, per site, which segment is degraded and the evidence for it |
 | P6 | Passive TCP: SPAN sensor where traffic is not proxied or tunnelled; good/bad session % over time; reports | Hourly good-session % per site and app, with the observation point recorded |
@@ -362,6 +362,21 @@ picked up and never answered, free their site after a timeout.
 
   In the first row the forward-train method could only report a floor of ~10.
   Limits, C and U flags, replay, count 0 and budget are covered by tests.
+- **P3.3 RFC 9946 speed tests** (`probe/lab/verify-speedtest.sh`, OB-UDPST
+  v9.1.0 built with `RATE_LIMITING=ON`, authenticated; expected = tbf rate ×
+  1250/1264 for udpst's 1222-octet payload):
+
+  | direction, tbf | expected | udpst client | through buffmon |
+  |---|---|---|---|
+  | up, 50 Mbit/s | 49.45 | 49.50 (+0.1%) | 49.48 (+0.1%) |
+  | down, 20 Mbit/s | 19.78 | 19.74 (−0.2%) | 19.74 (−0.2%) |
+  | up, 10 Mbit/s | 9.89 | 9.89 (0.0%) | |
+  | down, 100 Mbit/s | 98.89 | 98.87 (0.0%) | |
+
+  At the maximum, the RTT range was 103-139 ms and PDV 109-147 ms: the test
+  filled the shaper's queue (tbf latency 200 ms). Through an EdgeConnect
+  overlay that figure is the overlay shaper's buffer depth under load, which
+  is the bufferbloat users feel.
 
 ## 11. What has to be confirmed in the lab before P2+
 
