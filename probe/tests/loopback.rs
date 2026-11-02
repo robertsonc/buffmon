@@ -2,9 +2,10 @@
 //! echo, and TCP connect, each producing records through the public API.
 
 use buffmon_probe::config::ProbeConfig;
+use buffmon_probe::output::Item;
 use buffmon_probe::record::Record;
 use buffmon_probe::reflector::{Reflector, ReflectorConfig};
-use buffmon_probe::stamp::{ReflectorPacket, SenderPacket};
+use buffmon_probe::stamp::{Mode, ReflectorPacket, SenderPacket};
 use buffmon_probe::{icmp, stamp_session, sys, tcp};
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use std::net::{SocketAddrV4, TcpListener};
@@ -39,13 +40,13 @@ fn probe_config(body: &str) -> ProbeConfig {
     cfg
 }
 
-/// Collects records for `run_for`, then stops the sessions and drains.
-fn collect(
-    rx: mpsc::Receiver<Record>,
+/// Collects everything sessions emit for `run_for`, then stops them and drains.
+fn collect_items(
+    rx: mpsc::Receiver<Item>,
     stop: &AtomicBool,
     handles: Vec<JoinHandle<()>>,
     run_for: Duration,
-) -> Vec<Record> {
+) -> Vec<Item> {
     let deadline = Instant::now() + run_for;
     let mut out = Vec::new();
     while Instant::now() < deadline {
@@ -59,6 +60,22 @@ fn collect(
     }
     out.extend(rx.try_iter());
     out
+}
+
+/// As [`collect_items`], keeping only the per-second records.
+fn collect(
+    rx: mpsc::Receiver<Item>,
+    stop: &AtomicBool,
+    handles: Vec<JoinHandle<()>>,
+    run_for: Duration,
+) -> Vec<Record> {
+    collect_items(rx, stop, handles, run_for)
+        .into_iter()
+        .filter_map(|i| match i {
+            Item::Record(r) => Some(r),
+            _ => None,
+        })
+        .collect()
 }
 
 #[test]
@@ -105,8 +122,9 @@ fn reflector_reflects_dscp_size_and_ttl() {
     sock.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
     sys::enable_recv_tos(sock.as_raw_fd()).unwrap();
 
-    let mut pkt = vec![0_u8; 200];
-    SenderPacket { seq: 7, timestamp: 123, error_estimate: 0x0101 }.encode(&mut pkt);
+    let pkt = SenderPacket { seq: 7, timestamp: 123, error_estimate: 0x0101, ssid: 0 }
+        .build(Mode::Unauthenticated, None, &[], 200)
+        .unwrap();
     sock.send_to(&pkt, &SockAddr::from(addr)).unwrap();
     sock.send_to(&pkt, &SockAddr::from(addr)).unwrap();
 
@@ -131,8 +149,9 @@ fn reflector_ignores_sources_outside_the_allowlist() {
     let (addr, rstop, rh) = start_reflector(&["10.0.0.0/8"]);
     let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).unwrap();
     sock.set_read_timeout(Some(Duration::from_millis(400))).unwrap();
-    let mut pkt = [0_u8; 44];
-    SenderPacket { seq: 1, timestamp: 1, error_estimate: 1 }.encode(&mut pkt);
+    let pkt = SenderPacket { seq: 1, timestamp: 1, error_estimate: 1, ssid: 0 }
+        .build(Mode::Unauthenticated, None, &[], 44)
+        .unwrap();
     sock.send_to(&pkt, &SockAddr::from(addr)).unwrap();
     let mut buf = [0_u8; 128];
     let got = sys::recv_meta(sock.as_raw_fd(), &mut buf);

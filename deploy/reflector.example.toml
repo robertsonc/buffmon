@@ -19,3 +19,33 @@ session_idle_s = 300
 reflect_dscp = true
 
 stats_interval_s = 60
+
+# --- Authenticated STAMP (RFC 8762 authenticated mode, RFC 8972 HMAC TLV) ----
+# Sessions from these prefixes must be authenticated: the key is looked up by
+# the packet's SSID in keys_file, and a packet whose HMAC fails gets no reply.
+# Required before enabling anything that makes the reflector send more than it
+# received (RFC 10052 return trains).
+# authenticated_sources = ["10.0.0.0/8"]
+#
+# Mint a key per probe session (adds it here, writes a new 0600 file for the probe):
+#   buffmon-reflector --new-key 4101 --keys-file /etc/buffmon/stamp-keys.toml \
+#                     --key-out /root/sjc-br01-p1-dc1.key
+# Under systemd the file reaches the service as a credential (see
+# buffmon-reflector.service), so restart the reflector after adding a key.
+# Run outside systemd, the file is re-read within seconds of changing.
+# keys_file = "${CREDENTIALS_DIRECTORY}/stamp-keys"
+#
+# RFC 8972 requires a control to protect extensions in unauthenticated mode too.
+# protect_unauthenticated_extensions = false
+
+# --- RFC 10052 return trains (off by default) --------------------------------
+# Lets an authenticated probe session ask for a train back, so the probe can
+# measure return-direction capacity. Needs authenticated_sources: the
+# reflector only does this for packets that pass HMAC. A request over a limit
+# gets one packet back with the C flag; out-of-order requests get U.
+# [reflected_control]
+# enabled = true
+# max_packets = 256               # per request
+# max_volume_bytes = 393216       # per request (packets x length)
+# max_rate_bytes_per_s = 1000000  # average per source IP (bucket depth = max_volume_bytes)
+# max_packet_len = 1472           # egress MTU minus IPv4/UDP headers

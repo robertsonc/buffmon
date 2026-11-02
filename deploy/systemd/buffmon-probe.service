@@ -18,10 +18,16 @@ RestartSec=10s
 #   token_file = "${CREDENTIALS_DIRECTORY}/probe-token"
 # so probe.toml itself holds no secrets and can be world-readable.
 LoadCredential=probe-token:/etc/buffmon/probe-token
+# One per authenticated STAMP session ([stamp.auth] key_file =
+# "${CREDENTIALS_DIRECTORY}/stamp-dc1"), minted with buffmon-reflector --new-key.
+#LoadCredential=stamp-dc1:/etc/buffmon/stamp-dc1.key
+# RFC 9946 speed-test key file ([[speedtest]] key_file = "${CREDENTIALS_DIRECTORY}/udpst-keys").
+#LoadCredential=udpst-keys:/etc/buffmon/udpst.keys
 
 # --- Privileges ----------------------------------------------------------------
 DynamicUser=yes
-# Raw ICMP sockets. Nothing else.
+# Raw ICMP sockets (ICMP sessions, and reading routers' replies to route
+# traces). Nothing else.
 AmbientCapabilities=CAP_NET_RAW
 CapabilityBoundingSet=CAP_NET_RAW
 NoNewPrivileges=yes

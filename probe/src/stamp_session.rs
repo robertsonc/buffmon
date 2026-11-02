@@ -3,11 +3,13 @@
 //! records.
 
 use crate::clock;
-use crate::config::{parse_v4_endpoint, ProbeConfig, StampTarget};
+use crate::config::{load_key, parse_v4_endpoint, ProbeConfig, StampTarget};
 use crate::ntp;
+use crate::output::Item;
 use crate::record::{Record, SessionMeta};
-use crate::stamp::{ReflectorPacket, SenderPacket, PORT};
+use crate::stamp::{ParseError, SessionAuth, PORT};
 use crate::sys;
+use crate::trace::{self, TtlDebounce, TtlHint};
 use crate::tracker::{RemoteTimes, Reply, Tracker, TrackerConfig};
 use crate::{error_reason, lock, sleep_until, Throttle, POLL_INTERVAL};
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
@@ -23,7 +25,7 @@ use std::time::{Duration, Instant};
 pub fn spawn(
     probe: &ProbeConfig,
     t: &StampTarget,
-    out: Sender<Record>,
+    out: Sender<Item>,
     stop: Arc<AtomicBool>,
 ) -> io::Result<Vec<JoinHandle<()>>> {
     let invalid = |e: String| io::Error::new(io::ErrorKind::InvalidInput, e);
@@ -33,6 +35,10 @@ pub fn spawn(
         None => SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0),
     };
 
+    let auth = match &t.auth {
+        Some(a) => SessionAuth::authenticated(a.ssid, load_key(&a.key_file).map_err(invalid)?),
+        None => SessionAuth::none(),
+    };
     let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
     sock.bind(&SockAddr::from(src))?;
     sock.set_tos(u32::from(t.dscp) << 2)?;
@@ -54,41 +60,91 @@ pub fn spawn(
         dst: dst.to_string(),
     };
     log::info!(
-        "stamp {}: {} -> {} at {} pps, dscp {}, {} B, app_class {}",
+        "stamp {}: {} -> {} at {} pps, dscp {}, {} B, app_class {}, {}",
         t.name,
         local,
         dst,
         t.pps,
         t.dscp,
-        t.size,
-        meta.app_class
+        t.packet_len(),
+        meta.app_class,
+        match &t.auth {
+            Some(a) => format!("authenticated (SSID {})", a.ssid),
+            None => "unauthenticated".to_string(),
+        }
     );
 
     let tracker =
         Arc::new(Mutex::new(Tracker::new(TrackerConfig::new(probe.timeout_ms(t.timeout_ms), t.stateful_reflector))));
     let interval = Duration::from_secs_f64(1.0 / t.pps);
+    let hint = Arc::new(TtlHint::default());
+    let mut handles = Vec::new();
+
+    if t.trace.enabled {
+        let flow = trace::Flow { local, dst, tag: trace_tag(&t.name, local) };
+        handles.push(trace::spawn(
+            sock.try_clone()?,
+            t.trace.clone(),
+            meta.clone(),
+            flow,
+            Arc::clone(&hint),
+            out.clone(),
+            Arc::clone(&stop),
+        )?);
+    }
+    if let Some(cap) = t.capacity.as_ref().filter(|c| c.enabled) {
+        handles.push(crate::capacity::spawn(
+            cap.clone(),
+            auth.clone(),
+            local,
+            dst,
+            t.dscp,
+            Duration::from_millis(probe.timeout_ms(t.timeout_ms)),
+            meta.clone(),
+            out.clone(),
+            Arc::clone(&stop),
+        )?);
+    }
 
     let tx = {
         let sock = sock.try_clone()?;
         let tracker = Arc::clone(&tracker);
         let stop = Arc::clone(&stop);
         let name = t.name.clone();
-        let size = t.size;
+        let len = t.packet_len();
+        let auth = auth.clone();
         std::thread::Builder::new()
             .name(format!("stamp-tx-{name}"))
-            .spawn(move || send_loop(&sock, &tracker, interval, size, &stop, &name))?
+            .spawn(move || send_loop(&sock, &tracker, interval, len, &auth, &stop, &name))?
     };
     let rx = {
         let stop = Arc::clone(&stop);
         std::thread::Builder::new()
             .name(format!("stamp-rx-{}", t.name))
-            .spawn(move || recv_loop(&sock, &tracker, &meta, &out, &stop))?
+            .spawn(move || recv_loop(&sock, &tracker, &meta, &auth, &out, &hint, &stop))?
     };
-    Ok(vec![tx, rx])
+    handles.extend([tx, rx]);
+    Ok(handles)
 }
 
-fn send_loop(sock: &Socket, tracker: &Mutex<Tracker>, interval: Duration, size: usize, stop: &AtomicBool, name: &str) {
-    let mut buf = vec![0_u8; size];
+/// Identifies this session's trace packets when routers quote the payload.
+fn trace_tag(name: &str, local: SocketAddrV4) -> u16 {
+    let h = name
+        .bytes()
+        .chain(local.port().to_be_bytes())
+        .fold(0x811c_9dc5_u32, |h, b| (h ^ u32::from(b)).wrapping_mul(0x0100_0193));
+    (h ^ (h >> 16)) as u16
+}
+
+fn send_loop(
+    sock: &Socket,
+    tracker: &Mutex<Tracker>,
+    interval: Duration,
+    len: usize,
+    auth: &SessionAuth,
+    stop: &AtomicBool,
+    name: &str,
+) {
     let mut throttle = Throttle::new(Duration::from_secs(30));
     let start = Instant::now();
     let mut k: u32 = 0;
@@ -111,12 +167,19 @@ fn send_loop(sock: &Socket, tracker: &Mutex<Tracker>, interval: Duration, size: 
             let t1 = clock::now_ns();
             (tr.on_sent(t1), t1)
         };
-        SenderPacket {
-            seq: seq as u32,
-            timestamp: ntp::from_unix_ns(t1),
-            error_estimate: clock::encode_error_estimate(status),
-        }
-        .encode(&mut buf);
+        let buf =
+            match auth.sender_packet(seq as u32, ntp::from_unix_ns(t1), clock::encode_error_estimate(status), &[], len)
+            {
+                Ok(b) => b,
+                Err(e) => {
+                    // Config validation rules this out; never send a malformed packet.
+                    lock(tracker).on_failure(seq, "encode");
+                    if let Some(n) = throttle.ready() {
+                        log::error!("stamp {name}: cannot build a packet: {e} ({n} similar suppressed)");
+                    }
+                    continue;
+                }
+            };
         if let Err(e) = sock.send(&buf) {
             lock(tracker).on_failure(seq, error_reason(&e));
             if let Some(n) = throttle.ready() {
@@ -126,16 +189,31 @@ fn send_loop(sock: &Socket, tracker: &Mutex<Tracker>, interval: Duration, size: 
     }
 }
 
-fn recv_loop(sock: &Socket, tracker: &Mutex<Tracker>, meta: &SessionMeta, out: &Sender<Record>, stop: &AtomicBool) {
+fn recv_loop(
+    sock: &Socket,
+    tracker: &Mutex<Tracker>,
+    meta: &SessionMeta,
+    auth: &SessionAuth,
+    out: &Sender<Item>,
+    hint: &TtlHint,
+    stop: &AtomicBool,
+) {
     let fd = sock.as_raw_fd();
+    // A path-length change shows up in the TTLs within a second; the trace
+    // thread re-traces on it. Three equal replies in a row before it counts.
+    let mut ttl_debounce = TtlDebounce::new(3);
     let mut buf = [0_u8; 2048];
     let mut last_poll = Instant::now();
     let mut err_throttle = Throttle::new(Duration::from_secs(30));
     let mut malformed: u64 = 0;
+    let mut forged: u64 = 0;
     while !stop.load(Ordering::Relaxed) {
         match sys::recv_meta(fd, &mut buf) {
-            Ok(m) => match ReflectorPacket::decode(&buf[..m.len]) {
-                Some(p) => {
+            Ok(m) => match auth.parse_reflected(&buf[..m.len]) {
+                Ok((p, _ext)) => {
+                    if let Some(back) = m.ttl {
+                        ttl_debounce.observe(p.sender_ttl, back, hint);
+                    }
                     let t4 = m.kernel_ts_ns.unwrap_or_else(clock::now_ns);
                     let local = clock::status();
                     let (synced, err_us) = clock::decode_error_estimate(p.error_estimate);
@@ -160,7 +238,17 @@ fn recv_loop(sock: &Socket, tracker: &Mutex<Tracker>, meta: &SessionMeta, out: &
                         echoed_t1_ns: Some(ntp::to_unix_ns_near(p.sender_timestamp, t4)),
                     });
                 }
-                None => {
+                Err(ParseError::BadHmac | ParseError::UnknownSsid(_)) => {
+                    // Not from our reflector, or altered on the way: never used.
+                    forged += 1;
+                    if let Some(n) = err_throttle.ready() {
+                        log::warn!(
+                            "stamp {}: {forged} replies failed HMAC verification so far ({n} logs suppressed)",
+                            meta.session
+                        );
+                    }
+                }
+                Err(ParseError::Short) => {
                     malformed += 1;
                     if let Some(n) = err_throttle.ready() {
                         log::warn!(
@@ -184,7 +272,7 @@ fn recv_loop(sock: &Socket, tracker: &Mutex<Tracker>, meta: &SessionMeta, out: &
             last_poll = Instant::now();
             let buckets = lock(tracker).poll(clock::now_ns());
             for b in buckets {
-                if out.send(Record::new(meta, b)).is_err() {
+                if out.send(Record::new(meta, b).into()).is_err() {
                     return; // output thread gone: shutting down
                 }
             }

@@ -12,6 +12,11 @@ ExecStart=/usr/local/bin/buffmon-reflector --config /etc/buffmon/reflector.toml
 Restart=on-failure
 RestartSec=5s
 
+# Authenticated STAMP keys (keys_file = "${CREDENTIALS_DIRECTORY}/stamp-keys" in
+# reflector.toml). Root-owned 0600 on disk; systemd hands this service a private
+# copy at start, so restart after adding a key.
+#LoadCredential=stamp-keys:/etc/buffmon/stamp-keys.toml
+
 # --- Privileges ----------------------------------------------------------------
 DynamicUser=yes
 # UDP 862 is below 1024.

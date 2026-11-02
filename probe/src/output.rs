@@ -7,8 +7,11 @@
 //!   and back off; 413 split; 429/5xx/network keep and retry with backoff.
 //!   Retrying is safe: (probe_id, session, ts_ms) is an idempotency key.
 
+use crate::capacity::CapacityResult;
 use crate::config::OutputSection;
 use crate::record::Record;
+use crate::speedtest::SpeedtestResult;
+use crate::trace::RouteResult;
 use crate::Throttle;
 use serde::Serialize;
 use std::collections::VecDeque;
@@ -20,10 +23,54 @@ use std::time::{Duration, Instant};
 const BACKOFF_MIN: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(60);
 
+/// Anything a session produces for the ingest service.
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
+pub enum Item {
+    /// One second of a session (`records`).
+    Record(Record),
+    /// One forward route trace (`routes`).
+    Route(RouteResult),
+    /// One capacity measurement (`capacity`).
+    Capacity(CapacityResult),
+    /// One RFC 9946 speed test (`speedtests`).
+    Speedtest(SpeedtestResult),
+}
+
+impl From<Record> for Item {
+    fn from(r: Record) -> Self {
+        Item::Record(r)
+    }
+}
+
+/// The ingest batch. `routes` and `capacity` are left out when empty, so a batch
+/// of records alone is exactly the v1 shape.
 #[derive(Serialize)]
 struct Batch<'a> {
     probe_id: &'a str,
-    records: &'a [Record],
+    records: Vec<&'a Record>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    routes: Vec<&'a RouteResult>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    capacity: Vec<&'a CapacityResult>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    speedtests: Vec<&'a SpeedtestResult>,
+}
+
+impl<'a> Batch<'a> {
+    fn of(probe_id: &'a str, items: &'a [Item]) -> Self {
+        let mut b =
+            Batch { probe_id, records: Vec::new(), routes: Vec::new(), capacity: Vec::new(), speedtests: Vec::new() };
+        for i in items {
+            match i {
+                Item::Record(r) => b.records.push(r),
+                Item::Route(p) => b.routes.push(p),
+                Item::Capacity(c) => b.capacity.push(c),
+                Item::Speedtest(t) => b.speedtests.push(t),
+            }
+        }
+        b
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -50,25 +97,31 @@ pub struct Uploader {
     probe_id: String,
 }
 
+/// HTTP client for the ingest service (TLS with the OS trust store, timeouts,
+/// optional explicit proxy).
+pub fn http_agent(o: &OutputSection) -> Result<ureq::Agent, String> {
+    let mut builder = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(5))
+        .timeout(Duration::from_millis(o.timeout_ms))
+        .user_agent(&format!("buffmon-probe/{}", crate::VERSION));
+    if let Some(p) = &o.proxy {
+        builder = builder.proxy(ureq::Proxy::new(p).map_err(|e| format!("output.proxy {p:?}: {e}"))?);
+    }
+    Ok(builder.build())
+}
+
 impl Uploader {
     pub fn new(o: &OutputSection, url: &str, token: &str, probe_id: &str) -> Result<Self, String> {
-        let mut builder = ureq::AgentBuilder::new()
-            .timeout_connect(Duration::from_secs(5))
-            .timeout(Duration::from_millis(o.timeout_ms))
-            .user_agent(&format!("buffmon-probe/{}", crate::VERSION));
-        if let Some(p) = &o.proxy {
-            builder = builder.proxy(ureq::Proxy::new(p).map_err(|e| format!("output.proxy {p:?}: {e}"))?);
-        }
         Ok(Self {
-            agent: builder.build(),
+            agent: http_agent(o)?,
             url: url.to_string(),
             auth_header: format!("Bearer {token}"),
             probe_id: probe_id.to_string(),
         })
     }
 
-    pub fn post(&self, records: &[Record]) -> Outcome {
-        let body = match serde_json::to_vec(&Batch { probe_id: &self.probe_id, records }) {
+    pub fn post(&self, items: &[Item]) -> Outcome {
+        let body = match serde_json::to_vec(&Batch::of(&self.probe_id, items)) {
             Ok(b) => b,
             Err(e) => return Outcome::Drop(format!("serialise: {e}")),
         };
@@ -137,11 +190,11 @@ pub struct SinkStats {
 pub fn run(
     o: &OutputSection,
     uploader: Option<Uploader>,
-    rx: Receiver<Record>,
+    rx: Receiver<Item>,
     stop: &AtomicBool,
     print: bool,
 ) -> SinkStats {
-    let mut queue: VecDeque<Record> = VecDeque::new();
+    let mut queue: VecDeque<Item> = VecDeque::new();
     let mut stats = SinkStats { delivered: 0, dropped_overflow: 0, dropped_rejected: 0 };
     let mut overflow_log = Throttle::new(Duration::from_secs(30));
     let mut error_log = Throttle::new(Duration::from_secs(30));
@@ -192,7 +245,7 @@ pub fn run(
             // While stopping, make one final pass regardless of backoff.
             while !queue.is_empty() && (stopping || Instant::now() >= next_attempt) {
                 let n = queue.len().min(max_batch);
-                let batch: Vec<Record> = queue.drain(..n).collect();
+                let batch: Vec<Item> = queue.drain(..n).collect();
                 match up.post(&batch) {
                     Outcome::Delivered { accepted, duplicates, rejected } => {
                         stats.delivered += accepted + duplicates;
@@ -248,7 +301,7 @@ pub fn run(
     }
 }
 
-fn requeue(queue: &mut VecDeque<Record>, batch: Vec<Record>) {
+fn requeue(queue: &mut VecDeque<Item>, batch: Vec<Item>) {
     for r in batch.into_iter().rev() {
         queue.push_front(r);
     }
@@ -269,6 +322,54 @@ mod tests {
         assert!(seen[0] >= Duration::from_millis(800) && seen[0] <= Duration::from_millis(1200));
         assert!(seen.iter().all(|d| *d <= BACKOFF_MAX));
         assert!(*seen.last().unwrap() >= BACKOFF_MAX.mul_f64(0.8));
+    }
+
+    #[test]
+    fn batch_keeps_the_v1_shape_and_adds_routes_and_capacity_only_when_present() {
+        let meta = crate::record::SessionMeta {
+            probe_id: "p".into(),
+            site: "S".into(),
+            session: "s".into(),
+            kind: "stamp",
+            app_class: "bulk".into(),
+            dscp: 0,
+            src: "10.0.0.1:1".into(),
+            dst: "10.0.0.2:862".into(),
+        };
+        let rec = Record::new(&meta, crate::tracker::Bucket { ts_ms: 1000, interval_ms: 1000, ..Default::default() });
+        let only_records = [Item::from(rec.clone())];
+        let v = serde_json::to_value(Batch::of("p", &only_records)).unwrap();
+        assert_eq!(v.as_object().unwrap().keys().collect::<Vec<_>>(), ["probe_id", "records"]);
+        let path = crate::trace::RouteResult {
+            v: 1,
+            probe_id: "p".into(),
+            site: "S".into(),
+            session: "s".into(),
+            kind: "route",
+            app_class: "bulk".into(),
+            dscp: 0,
+            src: "10.0.0.1:1".into(),
+            dst: "10.0.0.2:862".into(),
+            ts_ms: 1000,
+            duration_ms: 3000,
+            trigger: "start",
+            ttl_fwd: Some(61),
+            ttl_back: Some(61),
+            hop_count_fwd: Some(3),
+            hops: vec![],
+            complete: false,
+            multipath: false,
+            signature: String::new(),
+            changed: false,
+            change_ttl: None,
+            change_reason: None,
+            prev_signature: None,
+        };
+        let mixed = [Item::from(rec), Item::Route(path)];
+        let v = serde_json::to_value(Batch::of("p", &mixed)).unwrap();
+        assert_eq!(v["records"].as_array().unwrap().len(), 1);
+        assert_eq!(v["routes"][0]["kind"], "route");
+        assert!(v.get("capacity").is_none());
     }
 
     #[test]

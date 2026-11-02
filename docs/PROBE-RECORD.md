@@ -12,13 +12,20 @@ authorization: Bearer <probe token>
 content-type: application/json
 content-encoding: gzip            (optional)
 
-{ "probe_id": "sjc-br01-p1", "records": [ <record>, ... ] }
+{ "probe_id": "sjc-br01-p1", "records": [ <record>, ... ],
+  "routes": [ <route>, ... ],        (optional, Phase 3)
+  "capacity": [ <capacity>, ... ],   (optional, Phase 3)
+  "speedtests": [ <speedtest>, ... ] }  (optional, Phase 3.3)
 ```
+
+`routes` and `capacity` are omitted when empty, so a batch of records alone has
+exactly the v1 shape. An ingest service that predates them ignores them.
 
 - At most 5,000 records and 4 MiB (decompressed) per request.
 - The token is bound to one `probe_id`. Every record's `probe_id` must match it.
-- `(probe_id, session, ts_ms)` is the idempotency key. Sending a record twice is
-  safe; the second copy is counted as a duplicate and dropped.
+- `(probe_id, session, ts_ms)` is the idempotency key, separately for records,
+  routes and capacity results. Sending one twice is safe; the second copy is
+  counted as a duplicate and dropped.
 
 Responses:
 
@@ -105,3 +112,141 @@ Responses:
 | `errors` | object | Failure reasons → counts, e.g. `{"timeout": 2, "refused": 1}` |
 
 Pairs that straddle two buckets (jitter, IPDV) are counted in the later bucket.
+
+## Route (Phase 3)
+
+One forward route trace of a STAMP session: a Paris traceroute sent from the
+session's own socket, so the 5-tuple and DSCP are the probes'. Emitted at start,
+every `trace.interval_s` (default 300 s), and within a second or two of the
+STAMP TTLs changing.
+
+```json
+{
+  "v": 1, "probe_id": "sjc-br01-p1", "site": "SJC-BR01", "session": "dc1-voice",
+  "kind": "route", "app_class": "voice", "dscp": 46,
+  "src": "10.1.1.10:40001", "dst": "10.10.0.20:862",
+  "ts_ms": 1761955230123, "duration_ms": 12, "trigger": "ttl_change",
+  "ttl_fwd": 60, "ttl_back": 61, "hop_count_fwd": 4,
+  "hops": [
+    {"ttl": 1, "addrs": ["10.1.1.1"], "rtt_us": 310, "sent": 3, "replies": 3},
+    {"ttl": 2, "addrs": ["192.0.2.6"], "rtt_us": 8120, "sent": 3, "replies": 3},
+    {"ttl": 3, "addrs": [], "rtt_us": null, "sent": 3, "replies": 0},
+    {"ttl": 4, "addrs": ["10.10.0.1"], "rtt_us": 20950, "sent": 3, "replies": 2}
+  ],
+  "complete": false, "multipath": false,
+  "signature": "10.1.1.1>192.0.2.6>*>10.10.0.1",
+  "changed": true, "change_ttl": 2, "change_reason": "hop",
+  "prev_signature": "10.1.1.1>192.0.2.2>10.10.0.1"
+}
+```
+
+| Field | Type | Notes |
+|---|---|---|
+| `kind` | `route` | |
+| `ts_ms` | int | Trace start, epoch ms (not bucket-aligned) |
+| `duration_ms` | int | |
+| `trigger` | `start` \| `schedule` \| `ttl_change` | `ttl_change`: the forward or return TTL of the STAMP replies moved |
+| `ttl_fwd`, `ttl_back` | int \| null | TTLs the session saw when the trace started |
+| `hop_count_fwd` | int \| null | Routers between probe and reflector: sent TTL − `ttl_fwd`. Traces stop there |
+| `hops[].ttl` | int | 1… |
+| `hops[].addrs` | string[] | Routers that answered for this TTL, sorted. Empty: none did (ICMP filtered or rate-limited). More than one: per-packet load balancing, or the path moved mid-trace |
+| `hops[].rtt_us` | int \| null | Lowest RTT over the replies |
+| `hops[].sent`, `hops[].replies` | int | Probes sent for this TTL (one per round) and replies |
+| `hops[].unreachable` | int | Present when the hop answered ICMP Destination Unreachable (its code); the path ends there |
+| `complete` | bool | Every TTL up to `hop_count_fwd` answered |
+| `multipath` | bool | Some TTL answered from more than one address |
+| `signature` | string | Hops joined by `>`, addresses of one hop by `\|`, `*` for silence |
+| `changed` | bool | Differs from the path known before: a TTL where routers answered both times and none match, or another `hop_count_fwd`. Silent hops never count |
+| `change_ttl` | int \| null | First TTL with all-new routers |
+| `change_reason` | `hop` \| `length` \| null | |
+| `prev_signature` | string \| null | The path before the change |
+
+Forward path only: a traceroute cannot show return hops. Return-path changes
+show as a change in `ttl_back`, which triggers a trace.
+
+## Capacity (Phase 3)
+
+Forward bottleneck capacity from packet-train dispersion, for STAMP sessions
+with `[stamp.capacity] enabled = true` (off by default). Trains run on their own
+socket (a separate STAMP session on the reflector) with the session's
+destination and, unless overridden, its DSCP.
+
+```json
+{
+  "v": 1, "probe_id": "sjc-br01-p1", "site": "SJC-BR01", "session": "dc1-voice",
+  "kind": "capacity", "app_class": "voice", "dscp": 0,
+  "src": "10.1.1.10:45122", "dst": "10.10.0.20:862",
+  "ts_ms": 1761955290000, "packets": 64, "size": 1200, "trains": 5, "valid_trains": 5,
+  "fwd_bps": 9950000, "fwd_bps_min": 9870000, "fwd_bps_max": 10060000,
+  "fwd_adr_bps": 25470000, "burst_trains": 5, "burst_bytes": 47296,
+  "back_bps": 7930000, "back_is_lower_bound": false, "back_method": "reflected_train",
+  "back_trains": 5, "back_valid_trains": 5, "back_bps_min": 7890000, "back_bps_max": 7930000,
+  "back_burst_bytes": 8045,
+  "lost": 0, "invalid": {}
+}
+```
+
+| Field | Type | Notes |
+|---|---|---|
+| `kind` | `capacity` | |
+| `ts_ms` | int | Measurement start, epoch ms |
+| `dscp`, `src` | | Of the train socket (may differ from the session's) |
+| `packets`, `size` | int | Packets per train, STAMP size in octets |
+| `trains`, `valid_trains` | int | Sent / usable |
+| `fwd_bps` | int \| null | Median sustained forward rate, bit/s at the IP layer (size + 28 octets per packet). From the tail of each train, so a shaper's burst allowance does not inflate it |
+| `fwd_bps_min`, `fwd_bps_max` | int \| null | Spread over valid trains |
+| `fwd_adr_bps` | int \| null | Median whole-train dispersion rate. Above `fwd_bps` when a burst got through first |
+| `burst_trains`, `burst_bytes` | int, int \| null | Trains whose head passed faster than the sustained rate, and the median octets that did |
+| `back_bps` | int \| null | Return rate |
+| `back_is_lower_bound` | bool | The return path did not re-space the train, so `back_bps` is a floor, not a measurement |
+| `back_method` | `forward_train` \| `reflected_train` | `reflected_train`: measured with RFC 10052 return trains (`return_trains = true`, authenticated session). Absent from older probes = `forward_train` |
+| `back_trains`, `back_valid_trains` | int | RFC 10052 return trains requested / usable |
+| `back_bps_min`, `back_bps_max`, `back_burst_bytes` | int \| null | Spread over return trains, and the return shaper's burst |
+| `lost` | int | Train packets without a reply |
+| `invalid` | object | Discarded trains by reason: `too_few`, `reordered`, `no_spread`, `sender_limited`; return trains as `back_too_few`, `back_reordered`, `back_no_spread`, `back_reflector_limited`; RFC 10052 requests as `back_not_processed` (U: reflector does not do it for this session), `back_refused` (C: a limit), `back_no_reply` |
+
+## Speed-test jobs and results (Phase 3.3)
+
+A probe with enabled `[[speedtest]]` targets checks in every `jobs.poll_s`:
+
+```
+POST /v1/probe/jobs
+authorization: Bearer <probe token>
+
+{ "probe_id": "sjc-br01-p1", "site": "SJC-BR01",
+  "targets": [ { "name": "dc1-st", "server": "st.dc1.example.net:24601",
+                 "directions": ["down", "up"], "max_mbps": 300,
+                 "max_duration_s": 10, "dscp": 0 } ] }
+
+-> { "jobs": [ { "job_id": "st-6f1c0a9e2b3d", "target": "dc1-st",
+                 "direction": "down", "max_mbps": 300, "duration_s": 10 } ] }
+```
+
+Targets advertise limits only (no keys, no paths). A job is handed out once.
+The probe runs it only if it fits its own limits; otherwise it reports it
+`refused`. Each job yields one result in the next batch's `speedtests`:
+
+```json
+{
+  "v": 1, "probe_id": "sjc-br01-p1", "site": "SJC-BR01", "kind": "speedtest",
+  "target": "dc1-st", "server": "st.dc1.example.net:24601",
+  "job_id": "st-6f1c0a9e2b3d", "direction": "down",
+  "ts_ms": 1761955290000, "duration_s": 10, "max_mbps": 300, "dscp": 0,
+  "status": "completed", "error_status": 0, "error": null,
+  "max_ip_capacity_mbps": 287.4, "loss_ratio_at_max": 0.0004,
+  "rtt_range_ms_at_max": 6.1, "pdv_range_ms_at_max": 4.0,
+  "summary_capacity_mbps": 250.2, "summary_loss_ratio": 0.001,
+  "delivered_pct": 99.9, "ecn_bleaching": false, "udpst_version": "9.1.0"
+}
+```
+
+| Field | Type | Notes |
+|---|---|---|
+| `kind` | `speedtest` | |
+| `job_id` | string | The job this answers. A result for a job the probe was not given is rejected |
+| `status` | `completed` \| `warning` \| `failed` \| `refused` | `warning`: udpst ErrorStatus 1-49; `failed`: 50+ or the client could not run; `refused`: outside this probe's limits |
+| `error_status`, `error` | int, string \| null | udpst's ErrorStatus and messages, or the probe's reason |
+| `max_ip_capacity_mbps` | float \| null | RFC 9097 Maximum IP-Layer Capacity, Mbit/s |
+| `loss_ratio_at_max`, `rtt_range_ms_at_max`, `pdv_range_ms_at_max` | float \| null | Conditions in the sub-interval of the maximum |
+| `summary_capacity_mbps`, `summary_loss_ratio`, `delivered_pct` | float \| null | Over the whole test |
+| `ecn_bleaching` | bool \| null | ECN bits were cleared on the path |

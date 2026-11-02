@@ -3,6 +3,7 @@
 
 use crate::clock;
 use crate::config::{ProbeConfig, TcpTarget};
+use crate::output::Item;
 use crate::record::{Record, SessionMeta};
 use crate::sys;
 use crate::tracker::{Reply, Tracker, TrackerConfig};
@@ -88,7 +89,7 @@ pub fn connect_once(target: &str, dscp: u8, timeout: Duration) -> Result<Connect
 pub fn spawn(
     probe: &ProbeConfig,
     t: &TcpTarget,
-    out: Sender<Record>,
+    out: Sender<Item>,
     stop: Arc<AtomicBool>,
 ) -> io::Result<Vec<JoinHandle<()>>> {
     let connect_timeout_ms = t.timeout_ms.unwrap_or(3000);
@@ -165,6 +166,6 @@ pub fn spawn(
     Ok(vec![handle])
 }
 
-fn emit(tracker: &mut Tracker, meta: &SessionMeta, out: &Sender<Record>) -> bool {
-    tracker.poll(clock::now_ns()).into_iter().all(|b| out.send(Record::new(meta, b)).is_ok())
+fn emit(tracker: &mut Tracker, meta: &SessionMeta, out: &Sender<Item>) -> bool {
+    tracker.poll(clock::now_ns()).into_iter().all(|b| out.send(Record::new(meta, b).into()).is_ok())
 }

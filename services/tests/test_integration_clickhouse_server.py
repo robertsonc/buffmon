@@ -249,3 +249,95 @@ def test_tunnel_summary_query_on_the_server(orch_db: str) -> None:
     assert (t47["tunnel_kind"], t47["transport"], t47["peer"]) == ("underlay", "INET1", "ec-b-01")
     assert t47["latency_ms"] == 42.0 and t47["latency_max_ms"] == 42.0
     assert tunnels["bondedTunnel_17"]["overlay"] == "DEFAULT"
+
+
+# -- Phase 3: route traces and capacity ----------------------------------------------
+
+@pytest.fixture
+def routes_db() -> Iterator[str]:
+    name = f"buffmon_it_{secrets.token_hex(4)}"
+    for stmt in _statements("004_routes.sql"):
+        _admin(stmt.replace("buffmon.", f"{name}.").replace("DATABASE IF NOT EXISTS buffmon", f"DATABASE {name}"))
+    try:
+        yield name
+    finally:
+        _admin("DROP DATABASE IF EXISTS {db:Identifier}", db=name)
+
+
+def test_routes_and_capacity_on_the_server(routes_db: str) -> None:
+    from buffmon.routes import (
+        CAPACITY_TABLE,
+        ROUTE_TABLE,
+        CapacityResult,
+        RouteResult,
+        capacity_to_row,
+        query_route_history,
+        route_to_row,
+    )
+    from tests.test_routes import PROBE_OUTPUT
+
+    now_ms = int(time.time() * 1000)
+    routes, caps = [], []
+    for i, line in enumerate(PROBE_OUTPUT.read_text().splitlines()):
+        # Real probe output (two lab runs), made recent and put in one session.
+        d = {**json.loads(line), "ts_ms": now_ms - 60_000 + i * 1000, "session": "dc-voice"}
+        if d["kind"] == "route":
+            routes.append(route_to_row(RouteResult.model_validate(d)))
+        else:
+            caps.append(capacity_to_row(CapacityResult.model_validate(d)))
+
+    async def go() -> dict[str, Any]:
+        t = _transport(routes_db)
+        try:
+            for _ in range(2):  # a retried batch
+                await t.insert_rows(ROUTE_TABLE, routes, batch_token(routes))
+                await t.insert_rows(CAPACITY_TABLE, caps, batch_token(caps))
+            return await query_route_history(t, "lab-p1", "dc-voice", now_ms - 3_600_000)
+        finally:
+            await t.aclose()
+
+    h = asyncio.run(go())
+    assert int(_admin("SELECT count() FROM {db:Identifier}.route_traces", db=routes_db)) == len(routes)
+    assert len(h["traces"]) == len(routes) and len(h["capacity"]) == len(caps)
+    (change,) = h["changes"]
+    assert change["changed"] is True and change["change_ttl"] == 2 and change["change_reason"] == "hop"
+    assert change["prev_signature"] == "10.90.1.1>10.90.2.2>10.90.4.2"
+    cap = h["capacity"][0]
+    assert cap["fwd_bps"] == 19_790_571 and cap["back_is_lower_bound"] is True and cap["burst_bytes"] == 7991
+    assert cap["back_method"] == "forward_train"
+    rfc10052 = h["capacity"][1]
+    assert (rfc10052["back_method"], rfc10052["back_is_lower_bound"]) == ("reflected_train", False)
+    assert rfc10052["back_valid_trains"] == 5 and 29_000_000 < rfc10052["back_bps"] < 30_500_000
+    hops = _admin("SELECT hop_addrs FROM {db:Identifier}.route_traces ORDER BY ts LIMIT 1 FORMAT TSV", db=routes_db)
+    assert hops == "[['10.90.1.1'],['10.90.2.2'],['10.90.4.2']]"
+
+
+# -- Phase 3.3: speed tests ---------------------------------------------------------------
+
+def test_speedtests_on_the_server() -> None:
+    from buffmon.speedtest import SPEEDTEST_TABLE, SpeedtestResult, query_history, result_to_row
+    from tests.test_speedtest import result
+
+    name = f"buffmon_it_{secrets.token_hex(4)}"
+    for stmt in _statements("005_speedtests.sql"):
+        _admin(stmt.replace("buffmon.", f"{name}.").replace("DATABASE IF NOT EXISTS buffmon", f"DATABASE {name}"))
+    try:
+        rows = [result_to_row(SpeedtestResult.model_validate(result("st-1"))),
+                result_to_row(SpeedtestResult.model_validate(result("st-2", status="refused", error="cap",
+                                                                    max_ip_capacity_mbps=None)))]
+
+        async def go() -> list[dict[str, Any]]:
+            t = _transport(name)
+            try:
+                await t.insert_rows(SPEEDTEST_TABLE, rows, content_token(rows))
+                await t.insert_rows(SPEEDTEST_TABLE, rows, content_token(rows))  # retried batch
+                return await query_history(t, "p1", int(time.time() * 1000) - 3_600_000)
+            finally:
+                await t.aclose()
+
+        got = {r["job_id"]: r for r in asyncio.run(go())}
+        assert int(_admin("SELECT count() FROM {db:Identifier}.speedtests", db=name)) == 2
+        assert got["st-1"]["max_ip_capacity_mbps"] == 287.4 and got["st-1"]["status"] == "completed"
+        assert got["st-2"]["status"] == "refused" and got["st-2"]["max_ip_capacity_mbps"] is None
+    finally:
+        _admin("DROP DATABASE IF EXISTS {db:Identifier}", db=name)

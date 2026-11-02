@@ -6,6 +6,7 @@
 
 use crate::clock;
 use crate::config::{IcmpTarget, ProbeConfig};
+use crate::output::Item;
 use crate::record::{Record, SessionMeta};
 use crate::sys;
 use crate::tracker::{Reply, Tracker, TrackerConfig};
@@ -100,7 +101,7 @@ fn session_tag(name: &str) -> u64 {
 pub fn spawn(
     probe: &ProbeConfig,
     t: &IcmpTarget,
-    out: Sender<Record>,
+    out: Sender<Item>,
     stop: Arc<AtomicBool>,
 ) -> io::Result<Vec<JoinHandle<()>>> {
     let (sock, mode) = open()?;
@@ -214,7 +215,7 @@ pub fn spawn(
                 if last_poll.elapsed() >= POLL_INTERVAL {
                     last_poll = Instant::now();
                     for b in lock(&tracker).poll(clock::now_ns()) {
-                        if out.send(Record::new(&meta, b)).is_err() {
+                        if out.send(Record::new(&meta, b).into()).is_err() {
                             return;
                         }
                     }
