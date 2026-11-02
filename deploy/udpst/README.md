@@ -5,8 +5,10 @@ OB-UDPST (`udpst`, BSD-3-Clause, TR-471; RFC 9946 compatible since 9.0.0).
 The probe runs the client; you run the server next to your reflectors.
 docs/DESIGN.md D14 explains what a speed test measures and why it is guarded.
 
-**Status: built and unit-tested in buffmon against OB-UDPST's documented CLI
-and JSON output. Not yet run end to end against a real `udpst` in the lab.**
+**Status: lab-verified with OB-UDPST v9.1.0** (`probe/lab/verify-speedtest.sh`):
+upstream and downstream Maximum IP-Layer Capacity within 0.2% of tbf-shaped
+rates, both with the udpst client directly and through buffmon (probe job
+poll, collector policy and API).
 
 ## Build (client and server), pinned
 
@@ -39,8 +41,11 @@ Install the same line on the server (its `-K` file, all IDs) and on the probe
 ## Server
 
 ```bash
-udpst -K /etc/buffmon/udpst.keys -B 1000 -t 10 -l /var/log/udpst.log
+udpst -4 -K /etc/buffmon/udpst.keys -B 1000 -t 10 -l /var/log/udpst.log
 ```
+
+- `-4`: the server binds IPv4 and IPv6 by default and exits with "Address
+  family not supported" on a host without IPv6. buffmon probes are IPv4-only.
 
 - `-B`: bandwidth the server can give (admission control, per direction).
 - `-t`: longest test it accepts.
