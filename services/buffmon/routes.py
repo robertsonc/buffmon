@@ -135,6 +135,13 @@ class CapacityResult(_Header):
     burst_bytes: Annotated[StrictInt, Field(ge=0, le=10**9)] | None = None
     back_bps: Bps = None
     back_is_lower_bound: StrictBool
+    # P3.2: how the return rate was obtained. Absent from older probes.
+    back_method: Literal["forward_train", "reflected_train"] = "forward_train"
+    back_trains: Annotated[StrictInt, Field(ge=0, le=100)] = 0
+    back_valid_trains: Annotated[StrictInt, Field(ge=0, le=100)] = 0
+    back_bps_min: Bps = None
+    back_bps_max: Bps = None
+    back_burst_bytes: Annotated[StrictInt, Field(ge=0, le=10**9)] | None = None
     lost: Annotated[StrictInt, Field(ge=0, le=102_400)]
     invalid: Annotated[
         dict[Annotated[str, Field(pattern=ERROR_KEY_PATTERN)], Annotated[StrictInt, Field(ge=0, le=100)]],
@@ -152,6 +159,10 @@ class CapacityResult(_Header):
         lo, mid, hi = self.fwd_bps_min, self.fwd_bps, self.fwd_bps_max
         if None not in (lo, mid, hi) and not (lo <= mid <= hi):  # type: ignore[operator]
             raise ValueError("fwd_bps_min <= fwd_bps <= fwd_bps_max")
+        if self.back_valid_trains > self.back_trains:
+            raise ValueError("back_valid_trains <= back_trains")
+        if self.back_method == "reflected_train" and (self.back_is_lower_bound or self.back_valid_trains == 0):
+            raise ValueError("a reflected_train return rate is measured (not a floor) from a valid train")
         return self
 
 
@@ -259,7 +270,8 @@ CAPACITY_SQL = """
 SELECT
     toUnixTimestamp64Milli(ts) AS ts_ms,
     dscp, packets, size, trains, valid_trains, fwd_bps, fwd_bps_min, fwd_bps_max, fwd_adr_bps,
-    burst_trains, burst_bytes, back_bps, back_is_lower_bound, lost
+    burst_trains, burst_bytes, back_bps, back_is_lower_bound, back_method, back_trains, back_valid_trains,
+    back_bps_min, back_bps_max, back_burst_bytes, lost
 FROM capacity FINAL
 WHERE probe_id = {probe_id:String} AND session = {session:String}
   AND ts >= fromUnixTimestamp64Milli({from_ms:Int64})

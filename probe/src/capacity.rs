@@ -16,6 +16,12 @@
 //!   arrives, so the return train starts out spaced like the forward one. If it
 //!   arrives spread wider (T4 vs T3), the return bottleneck is narrower and its
 //!   rate is measured; otherwise only a lower bound is known.
+//! * **Return trains (RFC 10052)**, with `return_trains = true`: one small
+//!   authenticated request asks the reflector for a back-to-back train, so the
+//!   return direction is measured directly (spacing at the probe's kernel
+//!   receive time vs the reflector's send time). Each run starts with a
+//!   1-packet request (RFC 10052 §5); a reflector that does not process the
+//!   request (U) or refuses it (C) leaves the forward-train floor in place.
 //! * Rates are IP-layer (STAMP size + 28 octets of IP/UDP header per packet).
 //!   A shaper that counts Ethernet framing reads ~1% higher for 1200-octet packets.
 //! * Trains with reordering, more than half lost, no measurable spread, or a
@@ -31,7 +37,7 @@ use crate::config::{parse_v4_endpoint, CapacityConfig};
 use crate::ntp;
 use crate::output::Item;
 use crate::record::SessionMeta;
-use crate::stamp::SessionAuth;
+use crate::stamp::{check_ext_hmac, flag, min_len, tlv_type, ExtIntegrity, ReflectedControl, SessionAuth};
 use crate::sys;
 use crate::{sleep_until, Throttle};
 use serde::Serialize;
@@ -179,6 +185,59 @@ pub fn estimate_train(obs: &[TrainObs], sent: u32, wire_bytes: u32, send_spread_
     e
 }
 
+/// One packet of an RFC 10052 return train.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReturnObs {
+    /// Reflector transmit time.
+    pub t3_ns: i64,
+    /// Probe receive time.
+    pub t4_ns: i64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReturnEstimate {
+    pub sent: u32,
+    pub received: u32,
+    pub invalid: Option<&'static str>,
+    pub bps: Option<f64>,
+    pub burst_bytes: Option<u64>,
+}
+
+/// Estimates the return bottleneck from a reflected train. Packets are put in
+/// send order by T3; `wire_bytes` is the IP-layer size of one reflected packet.
+pub fn estimate_return_train(obs: &[ReturnObs], sent: u32, wire_bytes: u32) -> ReturnEstimate {
+    let mut v = obs.to_vec();
+    v.sort_by_key(|o| o.t3_ns);
+    let received = v.len() as u32;
+    let mut e = ReturnEstimate { sent, received, invalid: None, bps: None, burst_bytes: None };
+    if received < 5 || received * 2 < sent {
+        e.invalid = Some("too_few");
+        return e;
+    }
+    let t4: Vec<i64> = v.iter().map(|o| o.t4_ns).collect();
+    if t4.windows(2).any(|w| w[1] < w[0]) {
+        e.invalid = Some("reordered");
+        return e;
+    }
+    let spread4 = t4[t4.len() - 1] - t4[0];
+    let spread3 = v[v.len() - 1].t3_ns - v[0].t3_ns;
+    if spread4 <= 0 {
+        e.invalid = Some("no_spread");
+        return e;
+    }
+    if spread3 * 2 > spread4 {
+        // The reflector could not send faster than the path spread the train.
+        e.invalid = Some("reflector_limited");
+        return e;
+    }
+    let wire_bits = f64::from(wire_bytes) * 8.0;
+    let (bps, burst) =
+        sustained(&t4, wire_bits).unwrap_or((f64::from(received - 1) * wire_bits / spread4 as f64 * 1e9, None));
+    e.bps = Some(bps);
+    e.burst_bytes = burst;
+    e
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct CapacityResult {
     pub v: u32,
@@ -208,6 +267,15 @@ pub struct CapacityResult {
     pub back_bps: Option<u64>,
     /// True when the return path did not re-space the train: back_bps is a floor.
     pub back_is_lower_bound: bool,
+    /// "reflected_train" (RFC 10052, measured) or "forward_train" (from the
+    /// forward trains' replies: measured if re-spaced, else a floor).
+    pub back_method: &'static str,
+    /// RFC 10052 return trains requested and usable.
+    pub back_trains: u32,
+    pub back_valid_trains: u32,
+    pub back_bps_min: Option<u64>,
+    pub back_bps_max: Option<u64>,
+    pub back_burst_bytes: Option<u64>,
     pub lost: u32,
     /// Discarded trains by reason.
     pub invalid: BTreeMap<String, u32>,
@@ -242,6 +310,38 @@ pub fn aggregate(trains: &[TrainEstimate]) -> Aggregate {
         back_bps: median(&mut back).map(round),
         back_is_lower_bound: back_floor,
         lost: trains.iter().map(|t| t.sent - t.received).sum(),
+        invalid,
+    }
+}
+
+/// Median, min and max over the usable return trains, and the median burst.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReturnAggregate {
+    pub valid: u32,
+    pub bps: Option<u64>,
+    pub bps_min: Option<u64>,
+    pub bps_max: Option<u64>,
+    pub burst_bytes: Option<u64>,
+    pub invalid: BTreeMap<String, u32>,
+}
+
+pub fn aggregate_return(trains: &[ReturnEstimate]) -> ReturnAggregate {
+    let mut bps: Vec<f64> = trains.iter().filter(|t| t.invalid.is_none()).filter_map(|t| t.bps).collect();
+    let mut bursts: Vec<f64> =
+        trains.iter().filter(|t| t.invalid.is_none()).filter_map(|t| t.burst_bytes.map(|b| b as f64)).collect();
+    let mut invalid = BTreeMap::new();
+    for t in trains {
+        if let Some(why) = t.invalid {
+            *invalid.entry(format!("back_{why}")).or_insert(0) += 1;
+        }
+    }
+    let round = |x: f64| x.round() as u64;
+    ReturnAggregate {
+        valid: bps.len() as u32,
+        bps_min: bps.iter().copied().reduce(f64::min).map(round),
+        bps_max: bps.iter().copied().reduce(f64::max).map(round),
+        bps: median(&mut bps).map(round),
+        burst_bytes: median(&mut bursts).map(round),
         invalid,
     }
 }
@@ -312,6 +412,64 @@ fn run_train(
     Ok((obs, send_spread_ns))
 }
 
+/// What came back for one RFC 10052 request.
+#[derive(Debug)]
+enum ReturnOutcome {
+    Train(Vec<ReturnObs>, u32),
+    /// The reflector did not process the request (U set): unsupported or not allowed.
+    NotProcessed,
+    /// The reflector hit a limit or the MTU (C set).
+    Refused,
+    NoReply,
+}
+
+/// Sends one RFC 10052 request and collects the train it brings back.
+fn run_return_train(
+    sock: &Socket,
+    auth: &SessionAuth,
+    seq: u32,
+    ctl: ReflectedControl,
+    timeout: Duration,
+) -> io::Result<ReturnOutcome> {
+    let tlv = ctl.tlv();
+    let len = min_len(auth.mode, std::slice::from_ref(&tlv), auth.key.is_some());
+    let status = clock::status();
+    let req = auth
+        .sender_packet(seq, ntp::from_unix_ns(clock::now_ns()), clock::encode_error_estimate(status), &[tlv], len)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    sock.send(&req)?;
+    let mut obs = Vec::with_capacity(usize::from(ctl.count));
+    let mut wire = 0_u32;
+    let mut buf = [0_u8; 9216];
+    let deadline = Instant::now() + timeout;
+    while obs.len() < usize::from(ctl.count) && Instant::now() < deadline {
+        let m = match sys::recv_meta(sock.as_raw_fd(), &mut buf) {
+            Ok(m) => m,
+            Err(e) if sys::is_timeout(&e) => continue,
+            Err(e) => return Err(e),
+        };
+        let t4 = m.kernel_ts_ns.unwrap_or_else(clock::now_ns);
+        let Ok((p, ext)) = auth.parse_reflected(&buf[..m.len]) else { continue };
+        if p.sender_seq != seq {
+            continue; // a late reply to something earlier
+        }
+        // The control TLV must come back with valid integrity to be trusted.
+        if check_ext_hmac(&ext, &p.seq.to_be_bytes(), auth.key.as_ref(), auth.key.is_some()) != ExtIntegrity::Valid {
+            continue;
+        }
+        let ctl_flags = ext.find(tlv_type::REFLECTED_CONTROL).map_or(flag::U, |t| t.flags);
+        if ctl_flags & (flag::U | flag::I) != 0 {
+            return Ok(ReturnOutcome::NotProcessed);
+        }
+        if ctl_flags & flag::C != 0 {
+            return Ok(ReturnOutcome::Refused);
+        }
+        wire = m.len as u32 + IP_UDP_OVERHEAD;
+        obs.push(ReturnObs { t3_ns: ntp::to_unix_ns_near(p.timestamp, t4), t4_ns: t4 });
+    }
+    Ok(if obs.is_empty() { ReturnOutcome::NoReply } else { ReturnOutcome::Train(obs, wire) })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn capacity_loop(
     sock: &Socket,
@@ -353,15 +511,78 @@ fn capacity_loop(
             continue;
         }
         let a = aggregate(&trains);
+
+        // Return direction, RFC 10052: a 1-packet request first (RFC 10052 §5),
+        // then the trains.
+        let mut back: Vec<ReturnEstimate> = Vec::new();
+        let mut back_note: Option<&'static str> = None;
+        if cfg.return_trains {
+            let probe = ReflectedControl { len: cfg.size as u16, count: 1, interval_ns: 0 };
+            let first = run_return_train(sock, auth, seq, probe, timeout);
+            seq = seq.wrapping_add(1);
+            match first {
+                Ok(ReturnOutcome::Train(..)) => {
+                    let ctl = ReflectedControl { len: cfg.size as u16, count: cfg.packets as u16, interval_ns: 0 };
+                    for _ in 0..cfg.trains {
+                        if !sleep_until(Instant::now() + Duration::from_millis(cfg.train_gap_ms), stop) {
+                            return;
+                        }
+                        match run_return_train(sock, auth, seq, ctl, timeout) {
+                            Ok(ReturnOutcome::Train(obs, wire)) => {
+                                back.push(estimate_return_train(&obs, u32::from(ctl.count), wire));
+                            }
+                            Ok(ReturnOutcome::Refused) => back_note = Some("back_refused"),
+                            Ok(ReturnOutcome::NotProcessed) => back_note = Some("back_not_processed"),
+                            Ok(ReturnOutcome::NoReply) => back_note = Some("back_no_reply"),
+                            Err(e) => {
+                                if let Some(n) = err_log.ready() {
+                                    log::warn!(
+                                        "stamp {}: return train failed: {e} ({n} similar suppressed)",
+                                        meta.session
+                                    );
+                                }
+                            }
+                        }
+                        seq = seq.wrapping_add(1);
+                    }
+                }
+                Ok(ReturnOutcome::NotProcessed) => {
+                    back_note = Some("back_not_processed");
+                    if let Some(n) = err_log.ready() {
+                        log::warn!(
+                            "stamp {}: the reflector does not process RFC 10052 requests from this session \
+                             (reflected_control disabled, or the session is not authenticated there) ({n} suppressed)",
+                            meta.session
+                        );
+                    }
+                }
+                Ok(ReturnOutcome::Refused) => back_note = Some("back_refused"),
+                Ok(ReturnOutcome::NoReply) => back_note = Some("back_no_reply"),
+                Err(e) => {
+                    if let Some(n) = err_log.ready() {
+                        log::warn!("stamp {}: return-train request failed: {e} ({n} similar suppressed)", meta.session);
+                    }
+                }
+            }
+        }
+        let ra = aggregate_return(&back);
+        let mut invalid = a.invalid.clone();
+        invalid.extend(ra.invalid.clone());
+        if let Some(n) = back_note {
+            *invalid.entry(n.to_string()).or_insert(0) += 1;
+        }
+        let measured_back = ra.bps.is_some();
         log::info!(
-            "stamp {}: capacity fwd {} (min {}, max {}, {} of {} trains){}",
+            "stamp {}: capacity fwd {} (min {}, max {}, {} of {} trains){}; back {}{}",
             meta.session,
             fmt_bps(a.fwd_bps),
             fmt_bps(a.fwd_bps_min),
             fmt_bps(a.fwd_bps_max),
             a.valid_trains,
             trains.len(),
-            a.burst_bytes.map(|b| format!(", burst ~{b} B")).unwrap_or_default()
+            a.burst_bytes.map(|b| format!(", burst ~{b} B")).unwrap_or_default(),
+            if measured_back { fmt_bps(ra.bps) } else { format!(">= {}", fmt_bps(a.back_bps)) },
+            if measured_back { format!(" ({} of {} return trains)", ra.valid, back.len()) } else { String::new() }
         );
         let result = CapacityResult {
             v: crate::record::RECORD_VERSION,
@@ -384,10 +605,16 @@ fn capacity_loop(
             fwd_adr_bps: a.fwd_adr_bps,
             burst_trains: a.burst_trains,
             burst_bytes: a.burst_bytes,
-            back_bps: a.back_bps,
-            back_is_lower_bound: a.back_is_lower_bound,
+            back_bps: if measured_back { ra.bps } else { a.back_bps },
+            back_is_lower_bound: if measured_back { false } else { a.back_is_lower_bound },
+            back_method: if measured_back { "reflected_train" } else { "forward_train" },
+            back_trains: back.len() as u32,
+            back_valid_trains: ra.valid,
+            back_bps_min: ra.bps_min,
+            back_bps_max: ra.bps_max,
+            back_burst_bytes: ra.burst_bytes,
             lost: a.lost,
-            invalid: a.invalid,
+            invalid,
         };
         if out.send(Item::Capacity(result)).is_err() {
             return;
@@ -549,6 +776,37 @@ mod tests {
         let e = estimate_train(&t, 48, WIRE, 0);
         assert!(close(e.fwd_bps.unwrap(), 20e6, 0.01), "{e:?}");
         assert_eq!(e.sent - e.received, 8);
+    }
+
+    /// A reflected train sent back to back (T3 1 µs apart) through a `bps` bottleneck.
+    fn back_train(n: u32, bps: f64) -> Vec<ReturnObs> {
+        let gap = f64::from(WIRE) * 8.0 / bps * 1e9;
+        (0..n)
+            .map(|i| ReturnObs { t3_ns: i64::from(i) * 1000, t4_ns: 5_000_000 + (f64::from(i) * gap) as i64 })
+            .collect()
+    }
+
+    #[test]
+    fn return_trains_measure_the_return_bottleneck() {
+        let e = estimate_return_train(&back_train(48, 8e6), 48, WIRE);
+        assert_eq!(e.invalid, None);
+        assert!(close(e.bps.unwrap(), 8e6, 0.01), "{e:?}");
+        // Out of send order on arrival: reordered.
+        let mut r = back_train(48, 8e6);
+        r[10].t4_ns = r[11].t4_ns + 1;
+        assert_eq!(estimate_return_train(&r, 48, WIRE).invalid, Some("reordered"));
+        // The reflector sent slower than the path spread it: nothing learnt.
+        let slow: Vec<ReturnObs> = back_train(48, 8e6).iter().map(|o| ReturnObs { t3_ns: o.t4_ns, ..*o }).collect();
+        assert_eq!(estimate_return_train(&slow, 48, WIRE).invalid, Some("reflector_limited"));
+        assert_eq!(estimate_return_train(&back_train(10, 8e6), 48, WIRE).invalid, Some("too_few"));
+        let agg = aggregate_return(&[
+            estimate_return_train(&back_train(48, 8e6), 48, WIRE),
+            estimate_return_train(&back_train(48, 9e6), 48, WIRE),
+            estimate_return_train(&r, 48, WIRE),
+        ]);
+        assert_eq!(agg.valid, 2);
+        assert_eq!(agg.invalid.get("back_reordered"), Some(&1));
+        assert!(close(agg.bps.unwrap() as f64, 8.5e6, 0.01));
     }
 
     #[test]

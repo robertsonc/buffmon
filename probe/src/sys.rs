@@ -212,6 +212,58 @@ pub fn send_many(fd: RawFd, bufs: &[Vec<u8>]) -> io::Result<usize> {
     Ok(sent)
 }
 
+/// Sends every buffer to `dst` with one `sendmmsg`, optionally overriding the
+/// TOS byte (unconnected socket, e.g. the reflector). Returns how many were sent.
+pub fn send_many_to_tos(fd: RawFd, bufs: &[Vec<u8>], dst: SocketAddrV4, tos: Option<u8>) -> io::Result<usize> {
+    // SAFETY: zeroed sockaddr_in/msghdr are valid; every pointer stored in the
+    // mmsghdrs points into `addr`, `iovs` or `controls`, which are not moved or
+    // dropped until after the last sendmmsg call below.
+    unsafe {
+        let mut addr: libc::sockaddr_in = zeroed();
+        addr.sin_family = libc::AF_INET as libc::sa_family_t;
+        addr.sin_port = dst.port().to_be();
+        addr.sin_addr.s_addr = u32::from(*dst.ip()).to_be();
+        let mut iovs: Vec<libc::iovec> =
+            bufs.iter().map(|b| libc::iovec { iov_base: b.as_ptr() as *mut libc::c_void, iov_len: b.len() }).collect();
+        let mut controls: Vec<CmsgBuf> = (0..bufs.len()).map(|_| CmsgBuf([0; 256])).collect();
+        let space = libc::CMSG_SPACE(size_of::<libc::c_int>() as u32) as usize;
+        let mut msgs: Vec<libc::mmsghdr> = Vec::with_capacity(bufs.len());
+        for (iov, control) in iovs.iter_mut().zip(controls.iter_mut()) {
+            let mut m: libc::mmsghdr = zeroed();
+            m.msg_hdr.msg_name = (&mut addr as *mut libc::sockaddr_in).cast();
+            m.msg_hdr.msg_namelen = size_of::<libc::sockaddr_in>() as libc::socklen_t;
+            m.msg_hdr.msg_iov = iov;
+            m.msg_hdr.msg_iovlen = 1;
+            if let Some(tos) = tos {
+                m.msg_hdr.msg_control = control.0.as_mut_ptr().cast();
+                m.msg_hdr.msg_controllen = space as _;
+                let cmsg = libc::CMSG_FIRSTHDR(&m.msg_hdr);
+                (*cmsg).cmsg_level = libc::IPPROTO_IP;
+                (*cmsg).cmsg_type = libc::IP_TOS;
+                (*cmsg).cmsg_len = libc::CMSG_LEN(size_of::<libc::c_int>() as u32) as _;
+                std::ptr::write_unaligned(libc::CMSG_DATA(cmsg).cast::<libc::c_int>(), libc::c_int::from(tos));
+            }
+            msgs.push(m);
+        }
+        let mut sent = 0;
+        while sent < msgs.len() {
+            let rc = libc::sendmmsg(fd, msgs[sent..].as_mut_ptr(), (msgs.len() - sent) as libc::c_uint, 0);
+            if rc < 0 {
+                let err = io::Error::last_os_error();
+                if err.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return if sent > 0 { Ok(sent) } else { Err(err) };
+            }
+            if rc == 0 {
+                break;
+            }
+            sent += rc as usize;
+        }
+        Ok(sent)
+    }
+}
+
 /// The socket's default IP TTL (what the kernel puts in unicast packets).
 pub fn ip_ttl(fd: RawFd) -> io::Result<u8> {
     let mut v: libc::c_int = 0;

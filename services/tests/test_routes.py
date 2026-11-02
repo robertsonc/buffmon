@@ -100,6 +100,10 @@ def test_invalid_routes(over: dict[str, Any], match: str) -> None:
     ({"valid_trains": 0, "burst_trains": 0}, "needs a valid train"),
     ({"fwd_bps": -1}, "greater than or equal"),
     ({"invalid": {"Bad Key": 1}}, "pattern"),
+    ({"back_method": "reflected_train"}, "measured"),
+    ({"back_method": "reflected_train", "back_is_lower_bound": False}, "measured"),
+    ({"back_trains": 1, "back_valid_trains": 2}, "back_valid_trains"),
+    ({"back_method": "guess"}, "back_method"),
 ])
 def test_invalid_capacity(over: dict[str, Any], match: str) -> None:
     with pytest.raises(ValidationError, match=match):
@@ -114,6 +118,8 @@ def test_real_probe_output_validates() -> None:
         model = RouteResult if d["kind"] == "route" else CapacityResult
         kinds.append(model.model_validate(d).kind)
     assert {"route", "capacity"} <= set(kinds)
+    methods = [json.loads(line).get("back_method") for line in PROBE_OUTPUT.read_text().splitlines()]
+    assert "reflected_train" in methods, "an RFC 10052 measurement from the lab is in the fixture"
 
 
 # -- the in-memory view ---------------------------------------------------------------

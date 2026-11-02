@@ -197,6 +197,17 @@ them correctly.
 - Return: the reflector replies as packets arrive, so the return train starts
   spaced like the forward one. Wider on arrival (T4 vs T3) means a narrower
   return bottleneck, measured; otherwise only a floor.
+- Return trains (P3.2, RFC 10052, `return_trains = true`): one small
+  authenticated request (144 octets) asks the reflector for a back-to-back
+  train; the probe times its arrival (T4) against the reflector's send times
+  (T3). Same sustained/burst estimator. Each run opens with a 1-packet request
+  (RFC 10052 §5). Reflector side: off by default, authenticated sessions with a
+  valid HMAC TLV only, per-request packet/volume/MTU limits and a per-source
+  average-rate bucket (over a limit: one packet back with C), out-of-order
+  requests get one packet with U, trains sent by a worker thread so they never
+  delay other sessions' replies. RFC 10052 §3 says the TLV Length "MUST NOT be
+  smaller than 12" while its fixed fields are 8 octets of value (RFC 8972
+  defines Length as the Value only); we send 8 and accept 8 or more.
 - Trains with reordering, > 50% loss, no spread or a sender slower than half
   the arrival spread are discarded; median over the rest; IP-layer bit/s.
 - Through EdgeConnect this is the overlay's capacity as the appliance shapes it
@@ -277,8 +288,8 @@ Per session, over rolling windows:
 | P1 (done) | STAMP sender + stateful reflector, ICMP, TCP; ingest with auth and dedup; ClickHouse; live dashboard; systemd units | In the lab, loss/latency/jitter per site and target reach the dashboard within 5 s; an injected 2% loss (`tc netem`) shows within 30 s, attributed to the right direction |
 | P2 (done, 9.7.2 mapping open) | EdgeConnect: IPFIX via goflow2 → ClickHouse; Orchestrator poller for tunnel/overlay stats and alarms, 9.7.2 and 10.x; probe path validation; underlay vs delivered loss | Each probe session shows the appliance and interfaces it actually used; pre-FEC vs post-FEC loss next to probe loss |
 | P3 (done, lab-verified) | Path characterisation: Paris-style traceroute with change detection; packet-train capacity estimate | Path changes flagged within one cycle; capacity estimate within ±20% of a known shaped rate on wired lab links |
-| P3.1 | Authenticated STAMP (RFC 8762 authenticated mode) and RFC 8972 TLVs (Extra Padding, HMAC) in probe and reflector; per-session keys | Authenticated and unauthenticated sessions run side by side against one reflector; a packet with a bad HMAC or unknown SSID is refused; byte layouts match the RFC figures |
-| P3.2 | RFC 10052 return-direction trains: reflector support (off by default, authenticated sessions only, rate and volume limits, replay check) and probe-side return capacity | Return capacity measured, not bounded, within ±20% of a known shaped return rate; limits and the C flag verified |
+| P3.1 (done) | Authenticated STAMP (RFC 8762 authenticated mode) and RFC 8972 TLVs (Extra Padding, HMAC) in probe and reflector; per-session keys | Authenticated and unauthenticated sessions run side by side against one reflector; a packet with a bad HMAC or unknown SSID is refused; byte layouts match the RFC figures |
+| P3.2 (done, lab-verified) | RFC 10052 return-direction trains: reflector support (off by default, authenticated sessions only, rate and volume limits, replay check) and probe-side return capacity | Return capacity measured, not bounded, within ±20% of a known shaped return rate; limits and the C flag verified |
 | P3.3 | RFC 9946 (UDPSTP) speed test as a guarded, on-demand test type, scheduled by the collector (one per appliance/overlay) | Upstream and downstream Maximum IP-Layer Capacity within ±10% of a shaped lab rate; refused without an explicit enable, above the rate cap, in a priority DSCP, or while another test runs behind the same appliance |
 | P4 | Identity graph: ClearPass, DHCP, Central/Mist; enrichment on arrival | Any IP at any time resolves to MAC, device and user where the sources know them |
 | P5 | UXI and HPE SSE ingestion; segment view; UXI as control group; wireless probes with radio context (D15) | One screen shows, per site, which segment is degraded and the evidence for it |
@@ -324,6 +335,24 @@ acceptance run `probe/lab/verify-p3.sh`): probe → r1 → three alternate paths
   per-packet path spraying can re-space trains), real routers' ICMP rate
   limiting at scale, and capacity above ~1 Gbit/s (interrupt coalescing makes
   kernel timestamps bunch up).
+
+### Phase 3.1 / 3.2 status
+
+- **P3.1 authenticated STAMP**: byte layouts tested against the RFC 8762 / 8972
+  figures and the RFC 4231 HMAC vector; authenticated and unauthenticated
+  sessions side by side on one reflector; wrong key or tampered base: no reply;
+  tampered extensions: reflected with I; older zero-padded probes still served.
+- **P3.2 RFC 10052 return trains** (`probe/lab/verify-return.sh`, authenticated
+  session, tbf each way; expected = tbf rate × 1228/1242):
+
+  | forward / return tbf | return expected | return measured | burst, configured → measured |
+  |---|---|---|---|
+  | 10 / 30 Mbit/s | 29.66 | 29.69 | 16384 → 15786 B |
+  | 50 / 8 Mbit/s | 7.91 | 7.91 | 8192 → 8045 B |
+  | unshaped / 100 Mbit/s | 98.87 | 98.97 | 32768 → 32076 B |
+
+  In the first row the forward-train method could only report a floor of ~10.
+  Limits, C and U flags, replay, count 0 and budget are covered by tests.
 
 ## 11. What has to be confirmed in the lab before P2+
 

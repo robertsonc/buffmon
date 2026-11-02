@@ -279,7 +279,8 @@ def test_routes_and_capacity_on_the_server(routes_db: str) -> None:
     now_ms = int(time.time() * 1000)
     routes, caps = [], []
     for i, line in enumerate(PROBE_OUTPUT.read_text().splitlines()):
-        d = {**json.loads(line), "ts_ms": now_ms - 60_000 + i * 1000}  # real probe output, recent
+        # Real probe output (two lab runs), made recent and put in one session.
+        d = {**json.loads(line), "ts_ms": now_ms - 60_000 + i * 1000, "session": "dc-voice"}
         if d["kind"] == "route":
             routes.append(route_to_row(RouteResult.model_validate(d)))
         else:
@@ -303,5 +304,9 @@ def test_routes_and_capacity_on_the_server(routes_db: str) -> None:
     assert change["prev_signature"] == "10.90.1.1>10.90.2.2>10.90.4.2"
     cap = h["capacity"][0]
     assert cap["fwd_bps"] == 19_790_571 and cap["back_is_lower_bound"] is True and cap["burst_bytes"] == 7991
+    assert cap["back_method"] == "forward_train"
+    rfc10052 = h["capacity"][1]
+    assert (rfc10052["back_method"], rfc10052["back_is_lower_bound"]) == ("reflected_train", False)
+    assert rfc10052["back_valid_trains"] == 5 and 29_000_000 < rfc10052["back_bps"] < 30_500_000
     hops = _admin("SELECT hop_addrs FROM {db:Identifier}.route_traces ORDER BY ts LIMIT 1 FORMAT TSV", db=routes_db)
     assert hops == "[['10.90.1.1'],['10.90.2.2'],['10.90.4.2']]"

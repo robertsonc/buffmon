@@ -68,6 +68,13 @@ CREATE TABLE IF NOT EXISTS buffmon.capacity
     burst_bytes         Nullable(UInt64),
     back_bps            Nullable(UInt64),
     back_is_lower_bound Bool,
+    -- forward_train (from the forward trains' replies) or reflected_train (RFC 10052)
+    back_method         LowCardinality(String) DEFAULT 'forward_train',
+    back_trains         UInt8 DEFAULT 0,
+    back_valid_trains   UInt8 DEFAULT 0,
+    back_bps_min        Nullable(UInt64),
+    back_bps_max        Nullable(UInt64),
+    back_burst_bytes    Nullable(UInt64),
     lost                UInt32,
     invalid             Map(LowCardinality(String), UInt32),
     ingested_at         DateTime64(3, 'UTC') DEFAULT now64(3)

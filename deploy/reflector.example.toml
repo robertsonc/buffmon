@@ -37,3 +37,15 @@ stats_interval_s = 60
 #
 # RFC 8972 requires a control to protect extensions in unauthenticated mode too.
 # protect_unauthenticated_extensions = false
+
+# --- RFC 10052 return trains (off by default) --------------------------------
+# Lets an authenticated probe session ask for a train back, so the probe can
+# measure return-direction capacity. Needs authenticated_sources: the
+# reflector only does this for packets that pass HMAC. A request over a limit
+# gets one packet back with the C flag; out-of-order requests get U.
+# [reflected_control]
+# enabled = true
+# max_packets = 256               # per request
+# max_volume_bytes = 393216       # per request (packets x length)
+# max_rate_bytes_per_s = 1000000  # average per source IP (bucket depth = max_volume_bytes)
+# max_packet_len = 1472           # egress MTU minus IPv4/UDP headers

@@ -4,10 +4,10 @@
 use buffmon_probe::config::ProbeConfig;
 use buffmon_probe::output::Item;
 use buffmon_probe::record::Record;
-use buffmon_probe::reflector::{add_key, parse_keys, Reflector, ReflectorConfig, Stats};
+use buffmon_probe::reflector::{add_key, parse_keys, ReflectedControlConfig, Reflector, ReflectorConfig, Stats};
 use buffmon_probe::stamp::{
-    check_ext_hmac, flag, parse_tlvs, tlv_type, ExtIntegrity, Key, Mode, ReflectorPacket, SenderPacket, Tlv,
-    AUTH_BASE_LEN, BASE_LEN,
+    check_ext_hmac, flag, min_len, parse_tlvs, tlv_type, ExtIntegrity, Key, Mode, ReflectedControl, ReflectorPacket,
+    SenderPacket, Tlv, AUTH_BASE_LEN, BASE_LEN,
 };
 use buffmon_probe::{stamp_session, sys};
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
@@ -203,4 +203,122 @@ fn keys_are_minted_added_and_reloaded() {
     for f in ["keys.toml", "p7.key"] {
         assert_eq!(std::fs::metadata(dir.join(f)).unwrap().permissions().mode() & 0o777, 0o600, "{f}");
     }
+}
+
+// -- RFC 10052 return trains -------------------------------------------------------------
+
+fn rc_cfg(keys: &Path, enabled: bool) -> ReflectorConfig {
+    let mut c = reflector_cfg(keys);
+    c.reflected_control = ReflectedControlConfig {
+        enabled,
+        max_packets: 64,
+        max_volume_bytes: 40_000,
+        max_rate_bytes_per_s: 1_000,
+        max_packet_len: 1472,
+    };
+    c
+}
+
+/// Sends `pkt` and collects every reply for `wait`.
+fn exchange_all(from: &str, to: SocketAddrV4, pkt: &[u8], wait: Duration) -> Vec<Vec<u8>> {
+    let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).unwrap();
+    sock.bind(&SockAddr::from(from.parse::<SocketAddrV4>().unwrap())).unwrap();
+    sock.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
+    sock.send_to(pkt, &SockAddr::from(to)).unwrap();
+    let mut out = Vec::new();
+    let mut buf = [0_u8; 9216];
+    let end = Instant::now() + wait;
+    while Instant::now() < end {
+        if let Ok(m) = sys::recv_meta(sock.as_raw_fd(), &mut buf) {
+            out.push(buf[..m.len].to_vec());
+        }
+    }
+    out
+}
+
+fn request(key: &Key, seq: u32, ctl: ReflectedControl, mode: Mode) -> Vec<u8> {
+    let sp = SenderPacket { seq, timestamp: 9, error_estimate: 0, ssid: SSID };
+    let tlv = ctl.tlv();
+    let k = (mode == Mode::Authenticated).then_some(key);
+    let len = min_len(mode, std::slice::from_ref(&tlv), k.is_some());
+    sp.build(mode, k, &[tlv], len).unwrap()
+}
+
+fn ctl_flags(key: &Key, r: &[u8]) -> u8 {
+    let (_, ext) = ReflectorPacket::parse(r, Mode::Authenticated, Some(key)).unwrap();
+    ext.find(tlv_type::REFLECTED_CONTROL).unwrap().flags
+}
+
+#[test]
+fn rfc_10052_trains_limits_and_refusals() {
+    let dir = tmpdir("rc");
+    let keys = write_keys(&dir);
+    let key = Key::from_hex(KEY_HEX).unwrap();
+    let (addr, stop, h) = start(rc_cfg(&keys, true));
+    let ok = ReflectedControl { len: 300, count: 10, interval_ns: 0 };
+    // One session (fixed source port): the replay check is per session.
+    const SRC: &str = "127.0.0.2:47001";
+
+    // A train: 10 packets of 300 octets, each authenticated, control processed (U, C clear).
+    let train = exchange_all(SRC, addr, &request(&key, 1, ok, Mode::Authenticated), Duration::from_millis(400));
+    assert_eq!(train.len(), 10);
+    for r in &train {
+        assert_eq!(r.len(), 300);
+        let (p, ext) = ReflectorPacket::parse(r, Mode::Authenticated, Some(&key)).unwrap();
+        assert_eq!(p.sender_seq, 1);
+        assert_eq!(check_ext_hmac(&ext, &p.seq.to_be_bytes(), Some(&key), true), ExtIntegrity::Valid);
+        assert_eq!(ctl_flags(&key, r) & (flag::U | flag::C), 0);
+    }
+    // A paced train keeps its spacing (1 ms apart) on the reflector's clock.
+    let paced = ReflectedControl { len: 200, count: 5, interval_ns: 1_000_000 };
+    let p5 = exchange_all(SRC, addr, &request(&key, 2, paced, Mode::Authenticated), Duration::from_millis(400));
+    let t3: Vec<u64> =
+        p5.iter().map(|r| ReflectorPacket::parse(r, Mode::Authenticated, Some(&key)).unwrap().0.timestamp).collect();
+    assert_eq!(t3.len(), 5);
+    let gaps_ms: Vec<f64> = t3.windows(2).map(|w| (w[1] - w[0]) as f64 / 4_294_967_296.0 * 1000.0).collect();
+    assert!(gaps_ms.iter().all(|g| (0.9..1.5).contains(g)), "{gaps_ms:?}");
+
+    // Replay (same sequence number): one packet, U set.
+    let replay = exchange_all(SRC, addr, &request(&key, 2, ok, Mode::Authenticated), Duration::from_millis(200));
+    assert_eq!(replay.len(), 1);
+    assert_ne!(ctl_flags(&key, &replay[0]) & flag::U, 0);
+    // Over max_packets: one packet, C set, at the reflected length.
+    let many = ReflectedControl { count: 65, ..ok };
+    let r = exchange_all(SRC, addr, &request(&key, 3, many, Mode::Authenticated), Duration::from_millis(200));
+    assert_eq!((r.len(), r[0].len()), (1, 300));
+    assert_ne!(ctl_flags(&key, &r[0]) & flag::C, 0);
+    // Longer than the MTU: one packet of max_packet_len, C set.
+    let jumbo = ReflectedControl { len: 4000, count: 2, interval_ns: 0 };
+    let r = exchange_all(SRC, addr, &request(&key, 4, jumbo, Mode::Authenticated), Duration::from_millis(200));
+    assert_eq!((r.len(), r[0].len()), (1, 1472));
+    assert_ne!(ctl_flags(&key, &r[0]) & flag::C, 0);
+    // Per-source budget (40 kB bucket, 1 kB/s): a 36 kB train fits once, not twice in a row.
+    let big = ReflectedControl { len: 1200, count: 30, interval_ns: 0 };
+    let r = exchange_all(SRC, addr, &request(&key, 5, big, Mode::Authenticated), Duration::from_millis(300));
+    assert_eq!(r.len(), 30);
+    let r = exchange_all(SRC, addr, &request(&key, 6, big, Mode::Authenticated), Duration::from_millis(200));
+    assert_eq!(r.len(), 1, "budget spent");
+    assert_ne!(ctl_flags(&key, &r[0]) & flag::C, 0);
+    // Count 0: no reply at all.
+    let none = ReflectedControl { count: 0, ..ok };
+    let r = exchange_all(SRC, addr, &request(&key, 7, none, Mode::Authenticated), Duration::from_millis(200));
+    assert!(r.is_empty());
+    // From an unauthenticated source: one ordinary reply, control not processed (U).
+    let r = exchange_all("127.0.0.1:0", addr, &request(&key, 8, ok, Mode::Unauthenticated), Duration::from_millis(200));
+    assert_eq!(r.len(), 1);
+    let (_, ext) = ReflectorPacket::parse(&r[0], Mode::Unauthenticated, None).unwrap();
+    assert_ne!(ext.find(tlv_type::REFLECTED_CONTROL).unwrap().flags & flag::U, 0);
+
+    stop.store(true, Ordering::Relaxed);
+    let stats = h.join().unwrap();
+    assert_eq!((stats.trains_sent, stats.trains_refused), (3, 3), "{stats:?}");
+    assert_eq!(stats.trains_not_processed, 2);
+
+    // A reflector with reflected_control off: U, never a train.
+    let (addr, stop, h) = start(rc_cfg(&keys, false));
+    let r = exchange_all(SRC, addr, &request(&key, 1, ok, Mode::Authenticated), Duration::from_millis(200));
+    assert_eq!(r.len(), 1);
+    assert_ne!(ctl_flags(&key, &r[0]) & flag::U, 0);
+    stop.store(true, Ordering::Relaxed);
+    h.join().unwrap();
 }

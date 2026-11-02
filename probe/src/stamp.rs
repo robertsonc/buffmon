@@ -258,6 +258,61 @@ pub fn check_ext_hmac(ext: &Extensions, seq_field: &[u8], key: Option<&Key>, req
     }
 }
 
+/// RFC 10052 Reflected Test Packet Control TLV (type 12): asks the reflector
+/// to answer one test packet with `count` packets of `len` octets, `interval_ns`
+/// apart (0 = back to back).
+///
+/// Length note: RFC 10052 §3 says the TLV Length "MUST NOT be smaller than 12
+/// octets", but its fixed fields are 8 octets of value, and RFC 8972 defines
+/// Length as the Value only (12 looks like it counts the 4-octet header). We
+/// send 8 and accept 8 or more.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReflectedControl {
+    pub len: u16,
+    pub count: u16,
+    pub interval_ns: u32,
+}
+
+impl ReflectedControl {
+    pub const VALUE_LEN: usize = 8;
+
+    pub fn tlv(&self) -> Tlv {
+        let mut v = Vec::with_capacity(Self::VALUE_LEN);
+        v.extend_from_slice(&self.len.to_be_bytes());
+        v.extend_from_slice(&self.count.to_be_bytes());
+        v.extend_from_slice(&self.interval_ns.to_be_bytes());
+        Tlv::new(tlv_type::REFLECTED_CONTROL, v)
+    }
+
+    pub fn parse(t: &Tlv) -> Option<Self> {
+        if t.typ != tlv_type::REFLECTED_CONTROL || t.value.len() < Self::VALUE_LEN {
+            return None;
+        }
+        let v = &t.value;
+        Some(Self {
+            len: u16::from_be_bytes([v[0], v[1]]),
+            count: u16::from_be_bytes([v[2], v[3]]),
+            interval_ns: u32::from_be_bytes([v[4], v[5], v[6], v[7]]),
+        })
+    }
+
+    /// Length of each reflected packet (RFC 10052 §3): the larger of the base
+    /// reflector packet plus the received TLVs other than Extra Padding (and the
+    /// HMAC TLV the reflector adds back), and the requested length rounded up to
+    /// a multiple of 4.
+    pub fn reflected_len(&self, mode: Mode, tlvs_without_padding: &[Tlv]) -> usize {
+        let min = mode.base_len() + tlvs_without_padding.iter().map(Tlv::encoded_len).sum::<usize>();
+        let want = usize::from(self.len).div_ceil(4) * 4;
+        let len = min.max(want);
+        // Room for an Extra Padding TLV, or exactly the minimum.
+        if len > min && len < min + TLV_HEADER {
+            min + TLV_HEADER
+        } else {
+            len
+        }
+    }
+}
+
 /// The TLVs a reflector sends back (RFC 8972 §4): every received TLV, U cleared
 /// on the ones it processed (`understood`), U set on the others, and U and I set
 /// on all of them when the extensions failed HMAC verification.
@@ -782,6 +837,26 @@ mod tests {
         let old = vec![0_u8; 16];
         let e = parse_tlvs(&old);
         assert_eq!((e.tlvs.len(), e.malformed.is_none()), (4, true));
+    }
+
+    #[test]
+    fn reflected_control_tlv_round_trips_and_sizes_replies() {
+        let c = ReflectedControl { len: 1201, count: 64, interval_ns: 0 };
+        let t = c.tlv();
+        assert_eq!((t.typ, t.value.len()), (12, 8));
+        assert_eq!(&t.value, &[0x04, 0xB1, 0, 64, 0, 0, 0, 0]);
+        assert_eq!(ReflectedControl::parse(&t), Some(c));
+        let mut longer = t.clone();
+        longer.value.extend_from_slice(&[0, 0, 0, 0]); // a 12-octet Length is accepted too
+        assert_eq!(ReflectedControl::parse(&longer), Some(c));
+        assert_eq!(ReflectedControl::parse(&Tlv::new(12, vec![0; 7])), None);
+        let hmac = Tlv::new(tlv_type::HMAC, vec![0; 16]);
+        let tlvs = [t, hmac];
+        // 1201 rounds up to 1204; the base + TLVs (112 + 12 + 20) is smaller.
+        assert_eq!(c.reflected_len(Mode::Authenticated, &tlvs), 1204);
+        // A request below the minimum gets the minimum.
+        let small = ReflectedControl { len: 10, ..c };
+        assert_eq!(small.reflected_len(Mode::Authenticated, &tlvs), 144);
     }
 
     #[test]

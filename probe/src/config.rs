@@ -190,6 +190,10 @@ pub struct CapacityConfig {
     pub train_gap_ms: u64,
     /// DSCP for the trains; defaults to the session's.
     pub dscp: Option<u8>,
+    /// Also measure the return direction with RFC 10052 reflected trains
+    /// (needs [stamp.auth] and a reflector with reflected_control enabled).
+    #[serde(default)]
+    pub return_trains: bool,
     #[serde(default = "d_cap_start_delay_s")]
     pub start_delay_s: u64,
 }
@@ -365,6 +369,13 @@ impl ProbeConfig {
             check_trace(&s.name, &s.trace)?;
             if let Some(c) = &s.capacity {
                 check_capacity(&s.name, c)?;
+                if c.return_trains && s.auth.is_none() {
+                    return Err(format!(
+                        "stamp {}: capacity.return_trains needs [stamp.auth]: reflectors only send return trains \
+                         to authenticated sessions",
+                        s.name
+                    ));
+                }
                 if !crate::stamp::len_ok(s.mode().base_len(), c.size) {
                     return Err(format!(
                         "stamp {}: capacity.size must be the base packet ({}) or at least {} more",

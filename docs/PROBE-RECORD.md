@@ -178,7 +178,9 @@ destination and, unless overridden, its DSCP.
   "ts_ms": 1761955290000, "packets": 64, "size": 1200, "trains": 5, "valid_trains": 5,
   "fwd_bps": 9950000, "fwd_bps_min": 9870000, "fwd_bps_max": 10060000,
   "fwd_adr_bps": 25470000, "burst_trains": 5, "burst_bytes": 47296,
-  "back_bps": 7930000, "back_is_lower_bound": false,
+  "back_bps": 7930000, "back_is_lower_bound": false, "back_method": "reflected_train",
+  "back_trains": 5, "back_valid_trains": 5, "back_bps_min": 7890000, "back_bps_max": 7930000,
+  "back_burst_bytes": 8045,
   "lost": 0, "invalid": {}
 }
 ```
@@ -196,6 +198,9 @@ destination and, unless overridden, its DSCP.
 | `burst_trains`, `burst_bytes` | int, int \| null | Trains whose head passed faster than the sustained rate, and the median octets that did |
 | `back_bps` | int \| null | Return rate |
 | `back_is_lower_bound` | bool | The return path did not re-space the train, so `back_bps` is a floor, not a measurement |
+| `back_method` | `forward_train` \| `reflected_train` | `reflected_train`: measured with RFC 10052 return trains (`return_trains = true`, authenticated session). Absent from older probes = `forward_train` |
+| `back_trains`, `back_valid_trains` | int | RFC 10052 return trains requested / usable |
+| `back_bps_min`, `back_bps_max`, `back_burst_bytes` | int \| null | Spread over return trains, and the return shaper's burst |
 | `lost` | int | Train packets without a reply |
-| `invalid` | object | Discarded trains by reason: `too_few`, `reordered`, `no_spread`, `sender_limited` |
+| `invalid` | object | Discarded trains by reason: `too_few`, `reordered`, `no_spread`, `sender_limited`; return trains as `back_too_few`, `back_reordered`, `back_no_spread`, `back_reflector_limited`; RFC 10052 requests as `back_not_processed` (U: reflector does not do it for this session), `back_refused` (C: a limit), `back_no_reply` |
 

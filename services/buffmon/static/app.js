@@ -502,7 +502,16 @@
         cu.appendChild(el("li", null, "Shaper burst: ~" + Math.round(c.burst_bytes / 1024) + " KB passes ahead of the sustained rate (" +
           c.burst_trains + "/" + c.valid_trains + " trains)"));
       }
-      cu.appendChild(el("li", null, "← " + (c.back_bps == null ? "–" : (c.back_is_lower_bound ? "at least " : "") + fmtBps(c.back_bps))));
+      if (c.back_method === "reflected_train") {
+        cu.appendChild(el("li", null, "← " + fmtBps(c.back_bps) + " (return trains, " + c.back_valid_trains + "/" +
+          c.back_trains + (c.back_bps_min != null ? ": " + fmtBps(c.back_bps_min) + " – " + fmtBps(c.back_bps_max) : "") + ")"));
+        if (c.back_burst_bytes != null) {
+          cu.appendChild(el("li", null, "Return shaper burst: ~" + Math.round(c.back_burst_bytes / 1024) + " KB"));
+        }
+      } else {
+        cu.appendChild(el("li", null, "← " + (c.back_bps == null ? "–" : (c.back_is_lower_bound ? "at least " : "") + fmtBps(c.back_bps)) +
+          (c.back_is_lower_bound ? " (a floor: enable return trains to measure it)" : "")));
+      }
       box.appendChild(cu);
     }
   }
