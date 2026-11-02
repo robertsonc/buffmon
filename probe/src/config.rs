@@ -20,7 +20,75 @@ pub struct ProbeConfig {
     pub icmp: Vec<IcmpTarget>,
     #[serde(default)]
     pub tcp: Vec<TcpTarget>,
+    /// RFC 9946 speed-test targets (P3.3). Tests run only when the collector
+    /// asks for one and the request fits this probe's own limits below.
+    #[serde(default)]
+    pub speedtest: Vec<SpeedtestTarget>,
+    #[serde(default)]
+    pub jobs: JobsSection,
 }
+
+/// `[[speedtest]]`: an RFC 9946 (UDPSTP) server this probe may test against,
+/// with OB-UDPST's `udpst` as the client. Every limit here is enforced by the
+/// probe itself, whatever the collector asks for.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SpeedtestTarget {
+    pub name: String,
+    /// Must be set to true: a speed test fills the path for its duration.
+    #[serde(default)]
+    pub enabled: bool,
+    /// UDPSTP server, `host` or `host:port` (port 24601 by default).
+    pub server: String,
+    /// The OB-UDPST client binary (absolute path).
+    #[serde(default = "d_udpst_path")]
+    pub udpst: String,
+    /// Highest rate a test may request, Mbit/s (`udpst -B`).
+    pub max_mbps: u32,
+    /// Longest test, seconds (`udpst -t`; RFC 9946 default 10).
+    #[serde(default = "d_st_duration")]
+    pub max_duration_s: u32,
+    /// DSCP for the test traffic. Priority classes (32 and up) are refused.
+    #[serde(default)]
+    pub dscp: u8,
+    /// Directions the collector may ask for: "down" and/or "up".
+    #[serde(default = "d_st_directions")]
+    pub directions: Vec<String>,
+    /// RFC 9946 authentication: a udpst key file (`udpst -K`). Never passed on
+    /// the command line, so the key does not show in the process list.
+    pub key_file: String,
+    /// Key ID within the key file (`udpst -y`).
+    #[serde(default)]
+    pub key_id: u8,
+}
+
+/// `[jobs]`: how a probe with speed-test targets asks the collector for work.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JobsSection {
+    #[serde(default = "d_jobs_poll_s")]
+    pub poll_s: u64,
+    /// Defaults to output.url with `/results` replaced by `/jobs`.
+    pub url: Option<String>,
+}
+
+impl Default for JobsSection {
+    fn default() -> Self {
+        Self { poll_s: d_jobs_poll_s(), url: None }
+    }
+}
+
+impl JobsSection {
+    pub fn resolved_url(&self, output_url: Option<&str>) -> Option<String> {
+        self.url
+            .clone()
+            .or_else(|| output_url.and_then(|u| u.strip_suffix("/results").map(|base| format!("{base}/jobs"))))
+    }
+}
+
+/// DSCP 32 and above (CS4, AF4x, CS5, VOICE-ADMIT, EF, CS6, CS7): priority
+/// classes where a speed test could starve real-time traffic or trip a policer.
+pub const SPEEDTEST_MAX_DSCP: u8 = 31;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -259,6 +327,18 @@ fn d_tcp_interval_ms() -> u64 {
 fn d_true() -> bool {
     true
 }
+fn d_udpst_path() -> String {
+    "/usr/local/bin/udpst".into()
+}
+fn d_st_duration() -> u32 {
+    10
+}
+fn d_st_directions() -> Vec<String> {
+    vec!["down".into(), "up".into()]
+}
+fn d_jobs_poll_s() -> u64 {
+    15
+}
 fn d_trace_interval_s() -> u64 {
     300
 }
@@ -426,6 +506,19 @@ impl ProbeConfig {
         if names.is_empty() {
             return Err("no sessions configured ([[stamp]], [[icmp]] or [[tcp]])".into());
         }
+        let mut st_names = HashSet::new();
+        for t in &self.speedtest {
+            check_speedtest(t)?;
+            if !st_names.insert(t.name.clone()) {
+                return Err(format!("speedtest name {:?} is used twice", t.name));
+            }
+        }
+        if !(5..=3600).contains(&self.jobs.poll_s) {
+            return Err("jobs.poll_s must be 5-3600".into());
+        }
+        if self.speedtest.iter().any(|t| t.enabled) && self.jobs.resolved_url(self.output.url.as_deref()).is_none() {
+            return Err("speed tests need jobs.url (or an output.url ending in /results)".into());
+        }
 
         let o = &self.output;
         if let Some(url) = &o.url {
@@ -517,6 +610,49 @@ fn check_capacity(name: &str, c: &CapacityConfig) -> Result<(), String> {
     }
     if c.start_delay_s > 3600 {
         return bad("start_delay_s must be 0-3600");
+    }
+    Ok(())
+}
+
+fn check_speedtest(t: &SpeedtestTarget) -> Result<(), String> {
+    let name = &t.name;
+    if !valid_name(name, 64) {
+        return Err(format!("speedtest name {name:?}: 1-64 chars of [A-Za-z0-9._-]"));
+    }
+    let host = t.server.rsplit_once(':').map_or(t.server.as_str(), |(h, p)| {
+        if p.chars().all(|c| c.is_ascii_digit()) && !p.is_empty() {
+            h
+        } else {
+            t.server.as_str()
+        }
+    });
+    if host.is_empty()
+        || host.len() > 253
+        || !host.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-'))
+        || host.starts_with('-')
+    {
+        return Err(format!("speedtest {name}: server must be a hostname or IPv4 address, optionally :port"));
+    }
+    if !t.udpst.starts_with('/') {
+        return Err(format!("speedtest {name}: udpst must be an absolute path"));
+    }
+    if !(1..=10_000).contains(&t.max_mbps) {
+        return Err(format!("speedtest {name}: max_mbps must be 1-10000"));
+    }
+    if !(1..=60).contains(&t.max_duration_s) {
+        return Err(format!("speedtest {name}: max_duration_s must be 1-60"));
+    }
+    if t.dscp > SPEEDTEST_MAX_DSCP {
+        return Err(format!(
+            "speedtest {name}: dscp {} is a priority class; speed tests are limited to DSCP 0-{SPEEDTEST_MAX_DSCP}",
+            t.dscp
+        ));
+    }
+    if t.directions.is_empty() || t.directions.iter().any(|d| d != "down" && d != "up") {
+        return Err(format!("speedtest {name}: directions must be \"down\" and/or \"up\""));
+    }
+    if t.key_file.trim().is_empty() {
+        return Err(format!("speedtest {name}: key_file is required (RFC 9946 authentication)"));
     }
     Ok(())
 }
@@ -668,6 +804,33 @@ mod tests {
         assert!(load_key(f.to_str().unwrap()).unwrap_err().contains("hex"));
         assert!(load_key("/nonexistent/key").unwrap_err().contains("cannot read"));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn speedtest_targets_are_validated() {
+        let base = format!(
+            "{MIN}\n[[speedtest]]\nname = \"dc1-st\"\nenabled = true\nserver = \"st.dc1.example:24601\"\n\
+             max_mbps = 500\nkey_file = \"/etc/buffmon/udpst.keys\"\n"
+        );
+        let c: ProbeConfig = toml::from_str(&base).unwrap();
+        c.validate().unwrap();
+        let t = &c.speedtest[0];
+        assert_eq!((t.max_duration_s, t.dscp, t.directions.len()), (10, 0, 2));
+        assert_eq!(
+            c.jobs.resolved_url(c.output.url.as_deref()).as_deref(),
+            Some("https://ingest.example:8443/v1/probe/jobs")
+        );
+        for (from, to) in [
+            ("max_mbps = 500", "max_mbps = 0"),
+            ("max_mbps = 500", "max_mbps = 500\ndscp = 46"),
+            ("max_mbps = 500", "max_mbps = 500\ndirections = [\"sideways\"]"),
+            ("max_mbps = 500", "max_mbps = 500\nmax_duration_s = 600"),
+            ("max_mbps = 500", "max_mbps = 500\nudpst = \"udpst\""),
+            ("st.dc1.example:24601", "st.dc1.example;rm -rf /"),
+        ] {
+            let c: ProbeConfig = toml::from_str(&base.replace(from, to)).unwrap();
+            assert!(c.validate().is_err(), "{to}");
+        }
     }
 
     #[test]

@@ -50,6 +50,12 @@ class Settings(BaseSettings):
     dedup_ttl_s: float = 900.0
     dedup_max_keys: int = 2_000_000
 
+    # --- RFC 9946 speed tests (P3.3) -------------------------------------
+    # YAML policy; unset = speed tests disabled. See deploy/speedtest-policy.example.yaml.
+    speedtest_policy: Path | None = None
+    # Must match the probes' [jobs] poll_s (used to tell a probe is still checking in).
+    speedtest_poll_s: float = Field(default=15.0, ge=5, le=3600)
+
     # --- Live hub ----------------------------------------------------------
     thresholds_file: Path = _SERVICES_DIR / "thresholds.yaml"
     live_retention_s: int = Field(default=900, ge=60)

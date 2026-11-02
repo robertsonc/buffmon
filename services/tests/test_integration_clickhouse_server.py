@@ -310,3 +310,34 @@ def test_routes_and_capacity_on_the_server(routes_db: str) -> None:
     assert rfc10052["back_valid_trains"] == 5 and 29_000_000 < rfc10052["back_bps"] < 30_500_000
     hops = _admin("SELECT hop_addrs FROM {db:Identifier}.route_traces ORDER BY ts LIMIT 1 FORMAT TSV", db=routes_db)
     assert hops == "[['10.90.1.1'],['10.90.2.2'],['10.90.4.2']]"
+
+
+# -- Phase 3.3: speed tests ---------------------------------------------------------------
+
+def test_speedtests_on_the_server() -> None:
+    from buffmon.speedtest import SPEEDTEST_TABLE, SpeedtestResult, query_history, result_to_row
+    from tests.test_speedtest import result
+
+    name = f"buffmon_it_{secrets.token_hex(4)}"
+    for stmt in _statements("005_speedtests.sql"):
+        _admin(stmt.replace("buffmon.", f"{name}.").replace("DATABASE IF NOT EXISTS buffmon", f"DATABASE {name}"))
+    try:
+        rows = [result_to_row(SpeedtestResult.model_validate(result("st-1"))),
+                result_to_row(SpeedtestResult.model_validate(result("st-2", status="refused", error="cap",
+                                                                    max_ip_capacity_mbps=None)))]
+
+        async def go() -> list[dict[str, Any]]:
+            t = _transport(name)
+            try:
+                await t.insert_rows(SPEEDTEST_TABLE, rows, content_token(rows))
+                await t.insert_rows(SPEEDTEST_TABLE, rows, content_token(rows))  # retried batch
+                return await query_history(t, "p1", int(time.time() * 1000) - 3_600_000)
+            finally:
+                await t.aclose()
+
+        got = {r["job_id"]: r for r in asyncio.run(go())}
+        assert int(_admin("SELECT count() FROM {db:Identifier}.speedtests", db=name)) == 2
+        assert got["st-1"]["max_ip_capacity_mbps"] == 287.4 and got["st-1"]["status"] == "completed"
+        assert got["st-2"]["status"] == "refused" and got["st-2"]["max_ip_capacity_mbps"] is None
+    finally:
+        _admin("DROP DATABASE IF EXISTS {db:Identifier}", db=name)

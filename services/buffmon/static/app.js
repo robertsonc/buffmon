@@ -21,7 +21,7 @@
   var LIVE_MS = 15 * 60 * 1000;
 
   var S = {
-    sessions: {}, list: [], series: {}, thresholds: null, retentionMs: 900000, paths: {}, pathsUnavailable: null, tunnels: [], routes: {},
+    sessions: {}, list: [], series: {}, thresholds: null, retentionMs: 900000, paths: {}, pathsUnavailable: null, tunnels: [], routes: {}, speed: null, speedMsg: "",
     filterStatus: null, search: "", cls: "", kind: "", lastMsgAt: 0, retry: 0,
     open: null, histRange: "1h", histTimer: null, cards: {}, siteEls: {}, ever: false,
   };
@@ -516,6 +516,92 @@
     }
   }
 
+  // -- RFC 9946 speed tests (on demand, guarded by the collector and the probe) --
+  var ST_ACTIVE = { queued: true, dispatched: true };
+  function renderSpeed(s) {
+    var box = $("d-speed");
+    box.textContent = "";
+    var sp = S.speed;
+    if (!sp) { box.appendChild(el("p", "muted", "Loading…")); return; }
+    if (!sp.enabled) {
+      box.appendChild(el("p", "muted", "Speed tests are disabled on this collector (no BUFFMON_SPEEDTEST_POLICY)."));
+      return;
+    }
+    var caps = sp.probes[s.probe_id];
+    var jobs = sp.jobs.filter(function (j) { return j.probe_id === s.probe_id; });
+    if (!caps) {
+      box.appendChild(el("p", "muted", "Probe " + s.probe_id + " has no speed-test targets enabled (or has not checked in)."));
+    } else {
+      var siteBusy = sp.jobs.filter(function (j) { return j.site === caps.site && ST_ACTIVE[j.state]; })[0];
+      var note = !caps.allowed ? "This probe is not in the speed-test policy."
+        : !sp.window_open ? "Outside the speed-test windows set in the policy."
+        : siteBusy ? "A test is running at " + caps.site + " (" + siteBusy.job_id + "): one per site at a time." : "";
+      box.appendChild(el("p", "muted", "Fills the path for the test's duration. Through an EdgeConnect overlay it " +
+        "measures what the appliance gives this traffic class, with users present, not the circuit."));
+      caps.targets.forEach(function (t) {
+        var row = el("div", "path-dir", t.name + " → " + t.server + " · up to " + t.max_mbps + " Mbit/s, " +
+          t.max_duration_s + " s, " + dscpName(t.dscp) + "  ");
+        t.directions.forEach(function (d) {
+          var b = el("button", "btn", d === "down" ? "Test ↓ download" : "Test ↑ upload");
+          b.type = "button";
+          b.disabled = !!note;
+          b.addEventListener("click", function () { requestSpeed(s.probe_id, t, d); });
+          row.appendChild(b);
+        });
+        box.appendChild(row);
+      });
+      if (note) box.appendChild(el("p", "muted", note));
+    }
+    if (S.speedMsg) box.appendChild(el("p", "warn", S.speedMsg));
+    if (jobs.length) {
+      var ul = el("ul", "path-hops");
+      jobs.slice(0, 6).forEach(function (j) {
+        var r = j.result || {};
+        var when = ago((Date.now() - (j.finished_ms || j.created_ms)) / 1000);
+        var text = (j.direction === "down" ? "↓ " : "↑ ") + j.target + " · " + j.state;
+        if (r.max_ip_capacity_mbps != null) {
+          text += " · max " + r.max_ip_capacity_mbps.toFixed(1) + " Mbit/s" +
+            (r.loss_ratio_at_max != null ? ", loss at max " + (r.loss_ratio_at_max * 100).toFixed(2) + "%" : "") +
+            (r.rtt_range_ms_at_max != null ? ", RTT range " + r.rtt_range_ms_at_max.toFixed(1) + " ms" : "");
+        }
+        if (r.error || j.note) text += " · " + (r.error || j.note);
+        ul.appendChild(el("li", j.state === "failed" || j.state === "lost" || j.state === "refused" ? "warn" : null,
+          text + " · " + when));
+      });
+      box.appendChild(ul);
+    }
+  }
+  function requestSpeed(probeId, t, direction) {
+    var what = (direction === "down" ? "download" : "upload") + " speed test from " + probeId + " to " + t.server +
+      " at up to " + t.max_mbps + " Mbit/s for " + t.max_duration_s + " s";
+    if (!window.confirm("Run a " + what + "?\n\nIt fills the path for its duration and competes with users' traffic.")) return;
+    S.speedMsg = "";
+    fetch("/v1/speedtests", {
+      method: "POST", credentials: "same-origin",
+      headers: { "content-type": "application/json", accept: "application/json" },
+      body: JSON.stringify({ probe_id: probeId, target: t.name, direction: direction })
+    }).then(function (r) {
+      return r.json().then(function (b) { if (!r.ok) throw new Error(b.error || ("HTTP " + r.status)); return b; });
+    }).then(function () { loadSpeed(); })
+      .catch(function (e) { S.speedMsg = "Not started: " + e.message; if (S.open) refreshDrawer(false); });
+  }
+  function loadSpeed() {
+    fetch("/v1/speedtests", { credentials: "same-origin", headers: { accept: "application/json" } })
+      .then(function (r) {
+        if (r.status === 401) { location.href = "/login"; throw new Error("login required"); }
+        return r.json().then(function (b) { if (!r.ok) throw new Error(b.error || ("HTTP " + r.status)); return b; });
+      })
+      .then(function (b) { S.speed = b; if (S.open) refreshDrawer(false); })
+      .catch(function () { /* keep the last snapshot */ });
+  }
+  // Poll fast only while a test is in flight.
+  setInterval(function () {
+    var active = S.speed && S.speed.jobs.some(function (j) { return ST_ACTIVE[j.state]; });
+    if (active || (S.open && !S.speed)) loadSpeed();
+  }, 3000);
+  setInterval(loadSpeed, 30000);
+  setTimeout(loadSpeed, 3000);
+
   function renderPathTunnels(s) {
     var box = $("d-tunnels");
     box.textContent = "";
@@ -538,6 +624,7 @@
     var s = S.sessions[S.open];
     if (!s) return;
     renderRoute(s);
+    renderSpeed(s);
     renderPath(s);
     renderPathTunnels(s);
     $("d-title").textContent = s.session;

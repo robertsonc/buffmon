@@ -10,6 +10,7 @@
 use crate::capacity::CapacityResult;
 use crate::config::OutputSection;
 use crate::record::Record;
+use crate::speedtest::SpeedtestResult;
 use crate::trace::RouteResult;
 use crate::Throttle;
 use serde::Serialize;
@@ -32,6 +33,8 @@ pub enum Item {
     Route(RouteResult),
     /// One capacity measurement (`capacity`).
     Capacity(CapacityResult),
+    /// One RFC 9946 speed test (`speedtests`).
+    Speedtest(SpeedtestResult),
 }
 
 impl From<Record> for Item {
@@ -50,16 +53,20 @@ struct Batch<'a> {
     routes: Vec<&'a RouteResult>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     capacity: Vec<&'a CapacityResult>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    speedtests: Vec<&'a SpeedtestResult>,
 }
 
 impl<'a> Batch<'a> {
     fn of(probe_id: &'a str, items: &'a [Item]) -> Self {
-        let mut b = Batch { probe_id, records: Vec::new(), routes: Vec::new(), capacity: Vec::new() };
+        let mut b =
+            Batch { probe_id, records: Vec::new(), routes: Vec::new(), capacity: Vec::new(), speedtests: Vec::new() };
         for i in items {
             match i {
                 Item::Record(r) => b.records.push(r),
                 Item::Route(p) => b.routes.push(p),
                 Item::Capacity(c) => b.capacity.push(c),
+                Item::Speedtest(t) => b.speedtests.push(t),
             }
         }
         b
@@ -90,17 +97,23 @@ pub struct Uploader {
     probe_id: String,
 }
 
+/// HTTP client for the ingest service (TLS with the OS trust store, timeouts,
+/// optional explicit proxy).
+pub fn http_agent(o: &OutputSection) -> Result<ureq::Agent, String> {
+    let mut builder = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(5))
+        .timeout(Duration::from_millis(o.timeout_ms))
+        .user_agent(&format!("buffmon-probe/{}", crate::VERSION));
+    if let Some(p) = &o.proxy {
+        builder = builder.proxy(ureq::Proxy::new(p).map_err(|e| format!("output.proxy {p:?}: {e}"))?);
+    }
+    Ok(builder.build())
+}
+
 impl Uploader {
     pub fn new(o: &OutputSection, url: &str, token: &str, probe_id: &str) -> Result<Self, String> {
-        let mut builder = ureq::AgentBuilder::new()
-            .timeout_connect(Duration::from_secs(5))
-            .timeout(Duration::from_millis(o.timeout_ms))
-            .user_agent(&format!("buffmon-probe/{}", crate::VERSION));
-        if let Some(p) = &o.proxy {
-            builder = builder.proxy(ureq::Proxy::new(p).map_err(|e| format!("output.proxy {p:?}: {e}"))?);
-        }
         Ok(Self {
-            agent: builder.build(),
+            agent: http_agent(o)?,
             url: url.to_string(),
             auth_header: format!("Bearer {token}"),
             probe_id: probe_id.to_string(),

@@ -32,8 +32,9 @@ FLOWS_TABLE = "flows"
 PROBE_FLOWS_TABLE = "probe_flows"
 ROUTE_TABLE = "route_traces"
 CAPACITY_TABLE = "capacity"
+SPEEDTEST_TABLE = "speedtests"
 # Tables the ingest side may write. Anything else is refused before a request is made.
-_TABLES = frozenset({SECOND_TABLE, FLOWS_TABLE, PROBE_FLOWS_TABLE, ROUTE_TABLE, CAPACITY_TABLE})
+_TABLES = frozenset({SECOND_TABLE, FLOWS_TABLE, PROBE_FLOWS_TABLE, ROUTE_TABLE, CAPACITY_TABLE, SPEEDTEST_TABLE})
 
 # range key -> (span seconds, bucket seconds, source table)
 HISTORY_RANGES: dict[str, tuple[int, int, str]] = {

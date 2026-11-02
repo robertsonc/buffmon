@@ -98,3 +98,19 @@ name = "salesforce"
 target = "login.salesforce.com:443"
 interval_ms = 10000
 app_class = "interactive"
+
+# --- RFC 9946 speed tests (on demand, off unless enabled) --------------------
+# Run only when someone asks from the dashboard AND the collector's policy and
+# these limits allow it. See deploy/udpst/README.md.
+# [[speedtest]]
+# name = "dc1-st"
+# enabled = true
+# server = "st.dc1.example.net:24601"
+# max_mbps = 300
+# max_duration_s = 10
+# dscp = 0
+# directions = ["down", "up"]
+# key_file = "${CREDENTIALS_DIRECTORY}/udpst-keys"
+# key_id = 7
+# [jobs]
+# poll_s = 15     # how often to ask the collector for jobs (only with enabled targets)

@@ -6,7 +6,7 @@
 //!   buffmon-probe --config probe.toml --check       # validate config and exit
 
 use buffmon_probe::config::{resolve_token, ProbeConfig};
-use buffmon_probe::{icmp, output, stamp_session, tcp};
+use buffmon_probe::{icmp, output, speedtest, stamp_session, tcp};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -61,6 +61,7 @@ fn main() -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    let mut token_for_jobs: Option<String> = None;
     let uploader = match &cfg.output.url {
         Some(url) => {
             let token = match resolve_token(&cfg.output) {
@@ -70,6 +71,7 @@ fn main() -> ExitCode {
                     return ExitCode::from(1);
                 }
             };
+            token_for_jobs = Some(token.clone());
             match output::Uploader::new(&cfg.output, url, &token, &cfg.probe_id) {
                 Ok(u) => Some(u),
                 Err(e) => {
@@ -86,12 +88,13 @@ fn main() -> ExitCode {
     };
     if check {
         println!(
-            "config OK: probe {} at {}, {} stamp / {} icmp / {} tcp session(s)",
+            "config OK: probe {} at {}, {} stamp / {} icmp / {} tcp session(s), {} speed-test target(s) enabled",
             cfg.probe_id,
             cfg.site,
             cfg.stamp.len(),
             cfg.icmp.len(),
-            cfg.tcp.len()
+            cfg.tcp.len(),
+            cfg.speedtest.iter().filter(|t| t.enabled).count()
         );
         return ExitCode::SUCCESS;
     }
@@ -124,6 +127,34 @@ fn main() -> ExitCode {
             Ok(h) => handles.extend(h),
             Err(e) => {
                 log::error!("tcp {}: {e}", t.name);
+                failed = true;
+            }
+        }
+    }
+    // RFC 9946 speed tests: only with enabled targets and an ingest service to ask.
+    if cfg.speedtest.iter().any(|t| t.enabled) {
+        match (cfg.jobs.resolved_url(cfg.output.url.as_deref()), &token_for_jobs, output::http_agent(&cfg.output)) {
+            (Some(url), Some(token), Ok(agent)) => {
+                let (out, stop) = (tx.clone(), Arc::clone(&stop));
+                let (probe_id, site, targets) = (cfg.probe_id.clone(), cfg.site.clone(), cfg.speedtest.clone());
+                let poll = std::time::Duration::from_secs(cfg.jobs.poll_s);
+                let auth = format!("Bearer {token}");
+                match std::thread::Builder::new().name("speedtest-jobs".into()).spawn(move || {
+                    speedtest::jobs_loop(&agent, &url, &auth, &probe_id, &site, &targets, poll, &out, &stop)
+                }) {
+                    Ok(h) => handles.push(h),
+                    Err(e) => {
+                        log::error!("speed tests: {e}");
+                        failed = true;
+                    }
+                }
+            }
+            (_, _, Err(e)) => {
+                log::error!("speed tests: {e}");
+                failed = true;
+            }
+            _ => {
+                log::error!("speed tests need output.url and a token");
                 failed = true;
             }
         }

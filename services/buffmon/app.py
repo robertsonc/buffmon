@@ -37,7 +37,28 @@ from .routes import (
     query_route_history,
     route_to_row,
 )
-from .store import HISTORY_RANGES, ClickHouseError, HttpTransport, SampleWriter, Transport, query_history, record_to_row
+from .speedtest import (
+    SPEEDTEST_TABLE,
+    JobBoard,
+    PolicyError,
+    Poll,
+    Refused,
+    SpeedtestResult,
+    load_policy,
+    result_to_row,
+)
+from .speedtest import query_history as query_speedtests
+from .store import (
+    HISTORY_RANGES,
+    ClickHouseError,
+    HttpTransport,
+    SampleWriter,
+    Transport,
+    batch_token,
+    content_token,
+    query_history,
+    record_to_row,
+)
 from .thresholds import ThresholdsFile
 from .tunnels import query_tunnels
 from .uiauth import COOKIE_NAME, UiAuth
@@ -80,7 +101,9 @@ class AppState:
     clock: Callable[[], float]
     route_writer: SampleWriter | None = None
     capacity_writer: SampleWriter | None = None
+    speedtest_writer: SampleWriter | None = None
     routes: RouteView = field(default_factory=RouteView)
+    jobs: JobBoard | None = None
     counters: Counters = field(default_factory=Counters)
     started_at: float = field(default_factory=time.time)
 
@@ -159,9 +182,18 @@ def build_state(settings: Settings, transport: Transport | None, clock: Callable
     )
     side_writers = {
         table: SampleWriter(transport, batch_max=1000, flush_interval_s=settings.insert_flush_interval_s,
-                            buffer_max=20_000, retry_max_s=settings.insert_retry_max_s, table=table)
-        for table in (ROUTE_TABLE, CAPACITY_TABLE)
+                            buffer_max=20_000, retry_max_s=settings.insert_retry_max_s, table=table,
+                            # Speed-test rows are keyed by job, not by session second.
+                            token_fn=content_token if table == SPEEDTEST_TABLE else batch_token)
+        for table in (ROUTE_TABLE, CAPACITY_TABLE, SPEEDTEST_TABLE)
     } if transport is not None else {}
+    try:
+        policy = load_policy(settings.speedtest_policy)
+    except PolicyError as exc:
+        raise ValueError(str(exc)) from exc
+    if policy.enabled:
+        log.warning("RFC 9946 speed tests ENABLED for probes %s (max %d Mbit/s, %d s, %d at once)",
+                    policy.probes, policy.max_mbps, policy.max_duration_s, policy.max_concurrent)
     if writer is None:
         log.warning("ClickHouse is disabled: live view only, nothing is stored and history is unavailable")
     return AppState(
@@ -188,6 +220,8 @@ def build_state(settings: Settings, transport: Transport | None, clock: Callable
         clock=clock,
         route_writer=side_writers.get(ROUTE_TABLE),
         capacity_writer=side_writers.get(CAPACITY_TABLE),
+        speedtest_writer=side_writers.get(SPEEDTEST_TABLE),
+        jobs=JobBoard(policy, clock=clock, poll_s=settings.speedtest_poll_s),
     )
 
 
@@ -204,7 +238,7 @@ def create_app(
         tasks: list[asyncio.Task[None]] = []
         if state.writer is not None:
             tasks.append(asyncio.create_task(state.writer.run(stop), name="clickhouse-writer"))
-        for w in (state.route_writer, state.capacity_writer):
+        for w in (state.route_writer, state.capacity_writer, state.speedtest_writer):
             if w is not None:
                 tasks.append(asyncio.create_task(w.run(stop), name="clickhouse-writer"))
         tasks.append(asyncio.create_task(_housekeeping(state, stop), name="housekeeping"))
@@ -215,7 +249,7 @@ def create_app(
             for t in tasks:
                 with contextlib.suppress(asyncio.CancelledError):
                     await asyncio.wait_for(t, timeout=5)
-            for w in (state.writer, state.route_writer, state.capacity_writer):
+            for w in (state.writer, state.route_writer, state.capacity_writer, state.speedtest_writer):
                 if w is not None and w.depth:
                     try:
                         await asyncio.wait_for(w.flush_once(), timeout=10)
@@ -274,7 +308,8 @@ def create_app(
             c.auth_failures += 1
             log.warning("probe token for %s used to submit probe_id %s", probe_id, batch.probe_id)
             return JSONResponse({"error": "token is not valid for this probe_id"}, status_code=403)
-        if len(batch.records) + len(batch.routes) + len(batch.capacity) > state.settings.max_records:
+        if len(batch.records) + len(batch.routes) + len(batch.capacity) + len(batch.speedtests) > \
+                state.settings.max_records:
             return JSONResponse(
                 {"error": f"at most {state.settings.max_records} records per request; split the batch"},
                 status_code=413,
@@ -346,6 +381,31 @@ def create_app(
                     state.routes.add_capacity(res)
                     capacity_rows.append(capacity_to_row(res))
                 accepted += 1
+        # Phase 3.3: speed-test results answer jobs this probe was given.
+        speed_rows: list[dict[str, Any]] = []
+        for i, raw in enumerate(batch.speedtests):
+            try:
+                st = SpeedtestResult.model_validate(raw)
+            except ValidationError as exc:
+                rejected += 1
+                errors.append({"section": "speedtests", "index": i, "error": _short_validation_error(exc)})
+                continue
+            if st.probe_id != probe_id:
+                rejected += 1
+                errors.append({"section": "speedtests", "index": i, "error": "probe_id does not match the token"})
+                continue
+            if state.dedup.seen(st.key):
+                duplicates += 1
+                continue
+            state.dedup.add(st.key)
+            if state.jobs is None or not state.jobs.complete(st):
+                rejected += 1
+                errors.append({"section": "speedtests", "index": i, "error": "not a job given to this probe"})
+                continue
+            speed_rows.append(result_to_row(st))
+            accepted += 1
+        if state.speedtest_writer is not None:
+            state.speedtest_writer.enqueue(speed_rows)
         if state.route_writer is not None:
             state.route_writer.enqueue(route_rows)
         if state.capacity_writer is not None:
@@ -355,10 +415,86 @@ def create_app(
         c.rejected += rejected
         if rejected:
             log.warning("probe %s: rejected %d of %d results (first: %s)", probe_id, rejected,
-                        len(batch.records) + len(batch.routes) + len(batch.capacity), errors[0]["error"])
+                        len(batch.records) + len(batch.routes) + len(batch.capacity) + len(batch.speedtests),
+                        errors[0]["error"])
         return JSONResponse(
             {"accepted": accepted, "duplicates": duplicates, "rejected": rejected, "errors": errors[:20]}
         )
+
+    # -- RFC 9946 speed tests (P3.3) -----------------------------------------
+    @app.post("/v1/probe/jobs")
+    async def probe_jobs(request: Request) -> JSONResponse:
+        """A probe with speed-test targets checks in and collects its jobs."""
+        probe_id = state.tokens.authenticate(bearer_token(request.headers.get("authorization")))
+        if probe_id is None:
+            return JSONResponse({"error": "missing or unknown probe token"}, status_code=401,
+                                headers={"WWW-Authenticate": "Bearer"})
+        try:
+            body = await _read_limited(request, 64 * 1024)
+            poll = Poll.model_validate(json.loads(body))
+        except PayloadTooLargeError:
+            return JSONResponse({"error": "body too large"}, status_code=413)
+        except (ValueError, ValidationError) as exc:
+            msg = _short_validation_error(exc) if isinstance(exc, ValidationError) else "body is not valid JSON"
+            return JSONResponse({"error": msg}, status_code=400)
+        if poll.probe_id != probe_id:
+            return JSONResponse({"error": "token is not valid for this probe_id"}, status_code=403)
+        jobs = state.jobs.poll(poll) if state.jobs is not None else []
+        return JSONResponse({"jobs": jobs})
+
+    @app.get("/v1/speedtests")
+    async def speedtests(request: Request) -> JSONResponse:
+        if not ui_ok(request):
+            return unauthorized()
+        board = state.jobs.snapshot() if state.jobs is not None else {"enabled": False, "probes": {}, "jobs": []}
+        return JSONResponse({"server_ms": int(state.clock() * 1000), **board})
+
+    @app.post("/v1/speedtests")
+    async def request_speedtest(request: Request) -> JSONResponse:
+        """Queue a speed test (dashboard). The policy, the site lock and the
+        probe's own limits all apply."""
+        if not ui_ok(request):
+            return unauthorized()
+        origin = request.headers.get("origin")
+        if origin and urlsplit(origin).netloc != request.headers.get("host"):
+            return JSONResponse({"error": "cross-origin request refused"}, status_code=403)
+        if request.headers.get("content-type", "").split(";")[0].strip() != "application/json":
+            return JSONResponse({"error": "content-type must be application/json"}, status_code=415)
+        try:
+            raw = json.loads(await _read_limited(request, 4096))
+        except (PayloadTooLargeError, ValueError):
+            return JSONResponse({"error": "body is not valid JSON"}, status_code=400)
+        if not isinstance(raw, dict):
+            return JSONResponse({"error": "body must be an object"}, status_code=400)
+        probe_id, target, direction = raw.get("probe_id"), raw.get("target"), raw.get("direction")
+        mbps, secs = raw.get("max_mbps"), raw.get("duration_s")
+        if not (isinstance(probe_id, str) and _NAME_RE.match(probe_id) and isinstance(target, str)
+                and _NAME_RE.match(target) and direction in ("down", "up")
+                and (mbps is None or type(mbps) is int) and (secs is None or type(secs) is int)):
+            return JSONResponse({"error": "need probe_id, target, direction (down|up); max_mbps and duration_s "
+                                          "are optional integers"}, status_code=400)
+        if state.jobs is None:
+            return JSONResponse({"error": "speed tests are disabled"}, status_code=403)
+        try:
+            job = state.jobs.request(probe_id, target, direction, mbps, secs)
+        except Refused as exc:
+            return JSONResponse({"error": exc.reason}, status_code=exc.status)
+        return JSONResponse({"job": job.public()}, status_code=202)
+
+    @app.get("/v1/probes/{probe_id}/speedtests")
+    async def speedtest_history(request: Request, probe_id: str, days: int = 30) -> JSONResponse:
+        if not ui_ok(request):
+            return unauthorized()
+        if not _NAME_RE.match(probe_id) or not 1 <= days <= 400:
+            return JSONResponse({"error": "invalid probe_id or days (1-400)"}, status_code=400)
+        if state.transport is None:
+            return JSONResponse({"error": "history unavailable: ClickHouse is disabled"}, status_code=503)
+        try:
+            rows = await query_speedtests(state.transport, probe_id, int(state.clock() * 1000) - days * 86_400_000)
+        except ClickHouseError as exc:
+            log.warning("speed-test history query failed: %s", exc)
+            return JSONResponse({"error": "history unavailable: storage query failed"}, status_code=503)
+        return JSONResponse({"probe_id": probe_id, "tests": rows})
 
     # -- health ---------------------------------------------------------------
     @app.get("/v1/health")

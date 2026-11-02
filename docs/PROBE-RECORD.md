@@ -14,7 +14,8 @@ content-encoding: gzip            (optional)
 
 { "probe_id": "sjc-br01-p1", "records": [ <record>, ... ],
   "routes": [ <route>, ... ],        (optional, Phase 3)
-  "capacity": [ <capacity>, ... ] }  (optional, Phase 3)
+  "capacity": [ <capacity>, ... ],   (optional, Phase 3)
+  "speedtests": [ <speedtest>, ... ] }  (optional, Phase 3.3)
 ```
 
 `routes` and `capacity` are omitted when empty, so a batch of records alone has
@@ -204,3 +205,48 @@ destination and, unless overridden, its DSCP.
 | `lost` | int | Train packets without a reply |
 | `invalid` | object | Discarded trains by reason: `too_few`, `reordered`, `no_spread`, `sender_limited`; return trains as `back_too_few`, `back_reordered`, `back_no_spread`, `back_reflector_limited`; RFC 10052 requests as `back_not_processed` (U: reflector does not do it for this session), `back_refused` (C: a limit), `back_no_reply` |
 
+## Speed-test jobs and results (Phase 3.3)
+
+A probe with enabled `[[speedtest]]` targets checks in every `jobs.poll_s`:
+
+```
+POST /v1/probe/jobs
+authorization: Bearer <probe token>
+
+{ "probe_id": "sjc-br01-p1", "site": "SJC-BR01",
+  "targets": [ { "name": "dc1-st", "server": "st.dc1.example.net:24601",
+                 "directions": ["down", "up"], "max_mbps": 300,
+                 "max_duration_s": 10, "dscp": 0 } ] }
+
+-> { "jobs": [ { "job_id": "st-6f1c0a9e2b3d", "target": "dc1-st",
+                 "direction": "down", "max_mbps": 300, "duration_s": 10 } ] }
+```
+
+Targets advertise limits only (no keys, no paths). A job is handed out once.
+The probe runs it only if it fits its own limits; otherwise it reports it
+`refused`. Each job yields one result in the next batch's `speedtests`:
+
+```json
+{
+  "v": 1, "probe_id": "sjc-br01-p1", "site": "SJC-BR01", "kind": "speedtest",
+  "target": "dc1-st", "server": "st.dc1.example.net:24601",
+  "job_id": "st-6f1c0a9e2b3d", "direction": "down",
+  "ts_ms": 1761955290000, "duration_s": 10, "max_mbps": 300, "dscp": 0,
+  "status": "completed", "error_status": 0, "error": null,
+  "max_ip_capacity_mbps": 287.4, "loss_ratio_at_max": 0.0004,
+  "rtt_range_ms_at_max": 6.1, "pdv_range_ms_at_max": 4.0,
+  "summary_capacity_mbps": 250.2, "summary_loss_ratio": 0.001,
+  "delivered_pct": 99.9, "ecn_bleaching": false, "udpst_version": "9.1.0"
+}
+```
+
+| Field | Type | Notes |
+|---|---|---|
+| `kind` | `speedtest` | |
+| `job_id` | string | The job this answers. A result for a job the probe was not given is rejected |
+| `status` | `completed` \| `warning` \| `failed` \| `refused` | `warning`: udpst ErrorStatus 1-49; `failed`: 50+ or the client could not run; `refused`: outside this probe's limits |
+| `error_status`, `error` | int, string \| null | udpst's ErrorStatus and messages, or the probe's reason |
+| `max_ip_capacity_mbps` | float \| null | RFC 9097 Maximum IP-Layer Capacity, Mbit/s |
+| `loss_ratio_at_max`, `rtt_range_ms_at_max`, `pdv_range_ms_at_max` | float \| null | Conditions in the sub-interval of the maximum |
+| `summary_capacity_mbps`, `summary_loss_ratio`, `delivered_pct` | float \| null | Over the whole test |
+| `ecn_bleaching` | bool \| null | ECN bits were cleared on the path |

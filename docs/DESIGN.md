@@ -290,7 +290,7 @@ Per session, over rolling windows:
 | P3 (done, lab-verified) | Path characterisation: Paris-style traceroute with change detection; packet-train capacity estimate | Path changes flagged within one cycle; capacity estimate within ±20% of a known shaped rate on wired lab links |
 | P3.1 (done) | Authenticated STAMP (RFC 8762 authenticated mode) and RFC 8972 TLVs (Extra Padding, HMAC) in probe and reflector; per-session keys | Authenticated and unauthenticated sessions run side by side against one reflector; a packet with a bad HMAC or unknown SSID is refused; byte layouts match the RFC figures |
 | P3.2 (done, lab-verified) | RFC 10052 return-direction trains: reflector support (off by default, authenticated sessions only, rate and volume limits, replay check) and probe-side return capacity | Return capacity measured, not bounded, within ±20% of a known shaped return rate; limits and the C flag verified |
-| P3.3 | RFC 9946 (UDPSTP) speed test as a guarded, on-demand test type, scheduled by the collector (one per appliance/overlay) | Upstream and downstream Maximum IP-Layer Capacity within ±10% of a shaped lab rate; refused without an explicit enable, above the rate cap, in a priority DSCP, or while another test runs behind the same appliance |
+| P3.3 (built; lab run pending) | RFC 9946 (UDPSTP) speed test as a guarded, on-demand test type, scheduled by the collector (one per appliance/overlay) | Upstream and downstream Maximum IP-Layer Capacity within ±10% of a shaped lab rate; refused without an explicit enable, above the rate cap, in a priority DSCP, or while another test runs behind the same appliance |
 | P4 | Identity graph: ClearPass, DHCP, Central/Mist; enrichment on arrival | Any IP at any time resolves to MAC, device and user where the sources know them |
 | P5 | UXI and HPE SSE ingestion; segment view; UXI as control group; wireless probes with radio context (D15) | One screen shows, per site, which segment is degraded and the evidence for it |
 | P6 | Passive TCP: SPAN sensor where traffic is not proxied or tunnelled; good/bad session % over time; reports | Hourly good-session % per site and app, with the observation point recorded |
@@ -335,6 +335,15 @@ acceptance run `probe/lab/verify-p3.sh`): probe → r1 → three alternate paths
   per-packet path spraying can re-space trains), real routers' ICMP rate
   limiting at scale, and capacity above ~1 Gbit/s (interrupt coalescing makes
   kernel timestamps bunch up).
+
+**Speed test** (P3.3, RFC 9946, on demand only): the collector's policy
+(`BUFFMON_SPEEDTEST_POLICY`: probes, rate and duration caps, DSCPs below 32,
+time windows, total concurrency) and a one-test-per-site lock decide whether a
+test may start; the probe takes the job on its next poll and checks it again
+against its own `[[speedtest]]` caps before running OB-UDPST's `udpst` (no
+shell, empty environment, no ambient capabilities, `-X` random payload, `-o`
+one-way delay variation, `-f json`, key from a file). Jobs not picked up, or
+picked up and never answered, free their site after a timeout.
 
 ### Phase 3.1 / 3.2 status
 

@@ -1,0 +1,36 @@
+# buffmon RFC 9946 speed-test policy (P3.3, docs/DESIGN.md D14).
+# Point BUFFMON_SPEEDTEST_POLICY at a copy of this file to enable on-demand
+# speed tests from the dashboard. Without it, speed tests are disabled.
+#
+# A speed test fills the path for its duration. Through an EdgeConnect overlay
+# it measures the capacity the appliance gives that traffic class (shaping,
+# QoS, FEC overhead, bonding), with production traffic present: not the
+# circuit. Every probe also enforces its own [[speedtest]] limits.
+
+enabled: true
+
+# Probes that may be asked (glob patterns on probe_id).
+probes: ["lab-*"]
+
+# Upper bounds for any request (each probe's own caps apply as well).
+max_mbps: 500
+max_duration_s: 10
+
+# DSCPs a test may use. Priority classes (32 and up: CS4, AF4x, CS5, EF, ...)
+# are never allowed.
+allowed_dscp: [0]
+
+# When on-demand tests may start. Omit for any time.
+windows:
+  - days: [mon, tue, wed, thu, fri]
+    start: "20:00"
+    end: "06:00"
+    tz: "America/Los_Angeles"
+  - days: [sat, sun]
+    start: "00:00"
+    end: "23:59"
+    tz: "America/Los_Angeles"
+
+# Tests running at once across all sites (one per site is always the rule:
+# two probes behind one EdgeConnect would measure each other).
+max_concurrent: 4

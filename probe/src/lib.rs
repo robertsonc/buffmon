@@ -17,6 +17,7 @@ pub mod ntp;
 pub mod output;
 pub mod record;
 pub mod reflector;
+pub mod speedtest;
 pub mod stamp;
 pub mod stamp_session;
 pub mod sys;

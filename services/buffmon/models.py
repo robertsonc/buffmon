@@ -147,3 +147,5 @@ class IngestBatch(BaseModel):
     # Phase 3 (optional): forward route traces and capacity measurements.
     routes: list[object] = []
     capacity: list[object] = []
+    # Phase 3.3 (optional): RFC 9946 speed-test results.
+    speedtests: list[object] = []
