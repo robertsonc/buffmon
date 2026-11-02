@@ -41,6 +41,14 @@ pps = 20                     # 600 packets per 30 s → can show loss < 1% (Wils
 dscp = 46                    # EF
 app_class = "voice"
 
+# Authenticated STAMP (RFC 8762): HMAC on every packet, so neither a spoofed
+# probe nor a forged reply can touch the measurement. The reflector must list
+# this probe's prefix in authenticated_sources and hold the key for this SSID.
+# Packets are at least 112 octets in this mode.
+# [stamp.auth]
+# ssid = 4101
+# key_file = "${CREDENTIALS_DIRECTORY}/stamp-dc1"
+
 [[stamp]]
 name = "dc1-video"
 target = "10.10.0.20:862"

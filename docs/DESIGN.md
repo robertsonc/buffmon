@@ -146,6 +146,16 @@ for the wire format.
 
 ### Route and capacity (Phase 3)
 
+**Authenticated STAMP** (P3.1, per session): RFC 8762 authenticated mode
+(HMAC-SHA-256/128 over the 96-octet base) and the RFC 8972 HMAC TLV over the
+extensions. Keys are per SSID, minted with `buffmon-reflector --new-key`; the
+reflector picks the mode per source prefix (`authenticated_sources`) and sends
+nothing back for a packet that fails. The probe drops replies that fail, so a
+forged reply cannot count as received. Packets larger than the base carry an
+Extra Padding TLV with pseudorandom content (RFC 8972 §4.1), not zeros: a
+compressing WAN optimiser cannot shrink them, and a TLV-aware reflector reads
+them correctly.
+
 **Route trace** (every STAMP session, on by default):
 
 - Paris traceroute sent from the STAMP session's **own socket**, so the 5-tuple
@@ -167,6 +177,13 @@ for the wire format.
 - Limits: forward hops only (a return change shows as `ttl_back` moving); an
   EdgeConnect overlay is one hop (the tunnel hides the underlay); a proxy (SSE)
   ends the visible route at the proxy.
+- Third-party reflectors: RFC 8762 §4.6 has a STAMP reflector answer a packet
+  shorter than the base with a base packet (TWAMP Light interop). Trace packets
+  stop at the known router count, so they reach the reflector only while that
+  count is unknown or right after the path got shorter. If one reaches a
+  third-party stateful reflector, its counter moves by one and that second's
+  forward/return split can be off by one packet (buffmon's own reflector
+  discards trace packets).
 
 **Capacity** (per STAMP session, off unless enabled):
 

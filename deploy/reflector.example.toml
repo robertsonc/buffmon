@@ -19,3 +19,21 @@ session_idle_s = 300
 reflect_dscp = true
 
 stats_interval_s = 60
+
+# --- Authenticated STAMP (RFC 8762 authenticated mode, RFC 8972 HMAC TLV) ----
+# Sessions from these prefixes must be authenticated: the key is looked up by
+# the packet's SSID in keys_file, and a packet whose HMAC fails gets no reply.
+# Required before enabling anything that makes the reflector send more than it
+# received (RFC 10052 return trains).
+# authenticated_sources = ["10.0.0.0/8"]
+#
+# Mint a key per probe session (adds it here, writes a new 0600 file for the probe):
+#   buffmon-reflector --new-key 4101 --keys-file /etc/buffmon/stamp-keys.toml \
+#                     --key-out /root/sjc-br01-p1-dc1.key
+# Under systemd the file reaches the service as a credential (see
+# buffmon-reflector.service), so restart the reflector after adding a key.
+# Run outside systemd, the file is re-read within seconds of changing.
+# keys_file = "${CREDENTIALS_DIRECTORY}/stamp-keys"
+#
+# RFC 8972 requires a control to protect extensions in unauthenticated mode too.
+# protect_unauthenticated_extensions = false

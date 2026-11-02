@@ -87,6 +87,44 @@ pub struct StampTarget {
     pub trace: TraceConfig,
     /// Packet-train capacity estimate (off unless `enabled = true`).
     pub capacity: Option<CapacityConfig>,
+    /// RFC 8762 authenticated mode (HMAC). Needed for extensions that make the
+    /// reflector send more than it received (RFC 10052 return trains).
+    pub auth: Option<StampAuth>,
+}
+
+/// `[stamp.auth]`: authenticated STAMP for this session.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StampAuth {
+    /// RFC 8972 Session-Sender Identifier (1-65535). The reflector looks the
+    /// session's key up by it, so it must be unique per reflector.
+    pub ssid: u16,
+    /// File holding the HMAC key as hex (16-64 octets). `${VAR}` is expanded,
+    /// so `${CREDENTIALS_DIRECTORY}/stamp-key` works with systemd credentials.
+    pub key_file: String,
+}
+
+impl StampTarget {
+    pub fn mode(&self) -> crate::stamp::Mode {
+        if self.auth.is_some() {
+            crate::stamp::Mode::Authenticated
+        } else {
+            crate::stamp::Mode::Unauthenticated
+        }
+    }
+
+    /// Packet length on the wire: `size`, but never below the mode's base packet.
+    pub fn packet_len(&self) -> usize {
+        self.size.max(self.mode().base_len())
+    }
+}
+
+/// Loads a hex HMAC key from a file (`${VAR}` expanded).
+pub fn load_key(path: &str) -> Result<crate::stamp::Key, String> {
+    let path = expand_env(path)?;
+    check_private(Path::new(&path));
+    let raw = std::fs::read_to_string(&path).map_err(|e| format!("cannot read key file {path}: {e}"))?;
+    crate::stamp::Key::from_hex(raw.trim()).map_err(|e| format!("key file {path}: {e}"))
 }
 
 /// `[stamp.trace]`: forward path tracing on the session's own flow.
@@ -327,6 +365,22 @@ impl ProbeConfig {
             check_trace(&s.name, &s.trace)?;
             if let Some(c) = &s.capacity {
                 check_capacity(&s.name, c)?;
+                if !crate::stamp::len_ok(s.mode().base_len(), c.size) {
+                    return Err(format!(
+                        "stamp {}: capacity.size must be the base packet ({}) or at least {} more",
+                        s.name,
+                        s.mode().base_len(),
+                        crate::stamp::TLV_HEADER
+                    ));
+                }
+            }
+            if let Some(a) = &s.auth {
+                if a.ssid == 0 {
+                    return Err(format!("stamp {}: auth.ssid must be 1-65535 (0 means none)", s.name));
+                }
+                if a.key_file.trim().is_empty() {
+                    return Err(format!("stamp {}: auth.key_file is empty", s.name));
+                }
             }
             if !(crate::stamp::BASE_LEN..=crate::stamp::MAX_LEN).contains(&s.size) {
                 return Err(format!(
@@ -334,6 +388,14 @@ impl ProbeConfig {
                     s.name,
                     crate::stamp::BASE_LEN,
                     crate::stamp::MAX_LEN
+                ));
+            }
+            if !crate::stamp::len_ok(s.mode().base_len(), s.packet_len()) {
+                return Err(format!(
+                    "stamp {}: size must be the base packet ({}) or at least {} more (room for an Extra Padding TLV)",
+                    s.name,
+                    s.mode().base_len(),
+                    crate::stamp::TLV_HEADER
                 ));
             }
         }
@@ -499,7 +561,7 @@ fn check_private(path: &Path) {
     use std::os::unix::fs::PermissionsExt;
     if let Ok(meta) = std::fs::metadata(path) {
         if meta.permissions().mode() & 0o077 != 0 {
-            log::warn!("token file {} is readable by group/others; chmod 600 it", path.display());
+            log::warn!("secret file {} is readable by group/others; chmod 600 it", path.display());
         }
     }
 }
@@ -568,6 +630,33 @@ mod tests {
             let c: ProbeConfig = toml::from_str(&format!("{MIN}\n{bad}\n")).unwrap();
             assert!(c.validate().unwrap_err().contains(msg), "{bad}");
         }
+    }
+
+    #[test]
+    fn auth_section_selects_authenticated_mode_and_a_112_octet_minimum() {
+        let c: ProbeConfig = toml::from_str(MIN).unwrap();
+        assert_eq!((c.stamp[0].mode(), c.stamp[0].packet_len()), (crate::stamp::Mode::Unauthenticated, 44));
+        let with = format!("{MIN}\n[stamp.auth]\nssid = 4101\nkey_file = \"/etc/buffmon/stamp-key\"\n");
+        let c: ProbeConfig = toml::from_str(&with).unwrap();
+        c.validate().unwrap();
+        assert_eq!((c.stamp[0].mode(), c.stamp[0].packet_len()), (crate::stamp::Mode::Authenticated, 112));
+        let zero = with.replace("ssid = 4101", "ssid = 0");
+        assert!(toml::from_str::<ProbeConfig>(&zero).unwrap().validate().unwrap_err().contains("auth.ssid"));
+        let odd = MIN.replace("app_class = \"voice\"", "app_class = \"voice\"\nsize = 46");
+        assert!(toml::from_str::<ProbeConfig>(&odd).unwrap().validate().unwrap_err().contains("Extra Padding"));
+    }
+
+    #[test]
+    fn keys_load_from_hex_files() {
+        let dir = std::env::temp_dir().join(format!("bm-key-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("k");
+        std::fs::write(&f, "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff\n").unwrap();
+        assert_eq!(load_key(f.to_str().unwrap()).unwrap().to_hex().len(), 64);
+        std::fs::write(&f, "not hex").unwrap();
+        assert!(load_key(f.to_str().unwrap()).unwrap_err().contains("hex"));
+        assert!(load_key("/nonexistent/key").unwrap_err().contains("cannot read"));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

@@ -31,7 +31,7 @@ use crate::config::{parse_v4_endpoint, CapacityConfig};
 use crate::ntp;
 use crate::output::Item;
 use crate::record::SessionMeta;
-use crate::stamp::{ReflectorPacket, SenderPacket};
+use crate::stamp::SessionAuth;
 use crate::sys;
 use crate::{sleep_until, Throttle};
 use serde::Serialize;
@@ -262,21 +262,27 @@ pub struct Aggregate {
 }
 
 /// Sends one train and collects its replies.
-fn run_train(sock: &Socket, cfg: &CapacityConfig, seq0: u32, timeout: Duration) -> io::Result<(Vec<TrainObs>, i64)> {
+fn run_train(
+    sock: &Socket,
+    cfg: &CapacityConfig,
+    auth: &SessionAuth,
+    seq0: u32,
+    timeout: Duration,
+) -> io::Result<(Vec<TrainObs>, i64)> {
     let status = clock::status();
     let t1 = clock::now_ns();
     let bufs: Vec<Vec<u8>> = (0..cfg.packets)
         .map(|i| {
-            let mut b = vec![0_u8; cfg.size];
-            SenderPacket {
-                seq: seq0.wrapping_add(i),
-                timestamp: ntp::from_unix_ns(t1),
-                error_estimate: clock::encode_error_estimate(status),
-            }
-            .encode(&mut b);
-            b
+            auth.sender_packet(
+                seq0.wrapping_add(i),
+                ntp::from_unix_ns(t1),
+                clock::encode_error_estimate(status),
+                &[],
+                cfg.size,
+            )
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))
         })
-        .collect();
+        .collect::<io::Result<_>>()?;
     let started = Instant::now();
     let n = sys::send_many(sock.as_raw_fd(), &bufs)?;
     let send_spread_ns = i64::try_from(started.elapsed().as_nanos()).unwrap_or(i64::MAX);
@@ -289,7 +295,8 @@ fn run_train(sock: &Socket, cfg: &CapacityConfig, seq0: u32, timeout: Duration) 
             Err(e) if sys::is_timeout(&e) => continue,
             Err(e) => return Err(e),
         };
-        let Some(p) = ReflectorPacket::decode(&buf[..m.len]) else { continue };
+        // In authenticated mode a reply that fails HMAC is not ours: skip it.
+        let Ok((p, _)) = auth.parse_reflected(&buf[..m.len]) else { continue };
         let idx = p.sender_seq.wrapping_sub(seq0);
         if idx >= cfg.packets {
             continue; // late reply from an earlier train
@@ -309,6 +316,7 @@ fn run_train(sock: &Socket, cfg: &CapacityConfig, seq0: u32, timeout: Duration) 
 fn capacity_loop(
     sock: &Socket,
     cfg: &CapacityConfig,
+    auth: &SessionAuth,
     meta: &SessionMeta,
     dscp: u8,
     timeout: Duration,
@@ -331,7 +339,7 @@ fn capacity_loop(
             if i > 0 && !sleep_until(Instant::now() + Duration::from_millis(cfg.train_gap_ms), stop) {
                 return;
             }
-            match run_train(sock, cfg, seq, timeout) {
+            match run_train(sock, cfg, auth, seq, timeout) {
                 Ok((obs, spread)) => trains.push(estimate_train(&obs, cfg.packets, wire, spread)),
                 Err(e) => {
                     if let Some(n) = err_log.ready() {
@@ -396,6 +404,7 @@ fn fmt_bps(v: Option<u64>) -> String {
 #[allow(clippy::too_many_arguments)]
 pub fn spawn(
     cfg: CapacityConfig,
+    auth: SessionAuth,
     session_src: SocketAddrV4,
     dst: SocketAddrV4,
     session_dscp: u8,
@@ -428,7 +437,7 @@ pub fn spawn(
     );
     std::thread::Builder::new()
         .name(format!("stamp-capacity-{}", meta.session))
-        .spawn(move || capacity_loop(&sock, &cfg, &meta, dscp, timeout, &out, &stop))
+        .spawn(move || capacity_loop(&sock, &cfg, &auth, &meta, dscp, timeout, &out, &stop))
 }
 
 #[cfg(test)]

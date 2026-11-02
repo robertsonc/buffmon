@@ -18,6 +18,9 @@ RestartSec=10s
 #   token_file = "${CREDENTIALS_DIRECTORY}/probe-token"
 # so probe.toml itself holds no secrets and can be world-readable.
 LoadCredential=probe-token:/etc/buffmon/probe-token
+# One per authenticated STAMP session ([stamp.auth] key_file =
+# "${CREDENTIALS_DIRECTORY}/stamp-dc1"), minted with buffmon-reflector --new-key.
+#LoadCredential=stamp-dc1:/etc/buffmon/stamp-dc1.key
 
 # --- Privileges ----------------------------------------------------------------
 DynamicUser=yes
